@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "vaultskimmer_v5_1_live.json"
+STATE_FILE = "vaultskimmer_v5_2_clean.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -29,7 +29,6 @@ PAIR_META_CACHE = {}
 
 
 def fmt_px(val):
-    """Smart decimal formatter: handles micro-cap coins like PEPE (8+ decimals) & majors cleanly."""
     v = float(val or 0.0)
     if v == 0:
         return "$0.0000"
@@ -40,7 +39,7 @@ def fmt_px(val):
     return f"${v:.4f}"
 
 
-def make_slot(pair, principal=10.0, skim_pct=1.0, pullback_pct=0.0, entry_price=0.0):
+def make_slot(pair, principal, skim_pct, pullback_pct=0.0, entry_price=0.0):
     return {
         "pair": pair,
         "principal_usdt": float(principal),
@@ -63,20 +62,19 @@ def make_slot(pair, principal=10.0, skim_pct=1.0, pullback_pct=0.0, entry_price=
         "unrealized_pnl_pct": 0.0,
         "slot_skimmed_usdt": 0.0,
         "slot_skim_count": 0,
-        "status_msg": "Initializing slot..."
+        "status_msg": "Slot armed — awaiting next scan..."
     }
 
 
+# 100% BLANK INITIAL STATE — Nothing runs or loads until commanded by user
 DEFAULT_STATE = {
     "mode": "PAPER",  # "PAPER" or "LIVE"
     "fee_buffer_pct": 0.20,
     "api_key": os.environ.get("GATE_API_KEY", ""),
     "api_secret": os.environ.get("GATE_API_SECRET", ""),
-    "slots": {
-        "QNT_USDT": make_slot("QNT_USDT", principal=10.0, skim_pct=1.0),
-        "SUI_USDT": make_slot("SUI_USDT", principal=10.0, skim_pct=1.0)
-    },
-    # Strictly separated Paper vs Live profit vaults
+    "api_connected": False,
+    "api_status_msg": "Not Connected — Paste Keys & Tap Sync",
+    "slots": {},  # Completely empty until user adds a token
     "paper_skimmed_usdt": 0.0,
     "paper_skim_count": 0,
     "live_skimmed_usdt": 0.0,
@@ -115,8 +113,8 @@ def load_state():
             with open(STATE_FILE, "r") as f:
                 saved = json.load(f)
                 STATE.update(saved)
-                if not STATE.get("slots"):
-                    STATE["slots"] = DEFAULT_STATE["slots"].copy()
+                if "slots" not in STATE or not isinstance(STATE["slots"], dict):
+                    STATE["slots"] = {}
         except Exception as e:
             add_log(f"State load notice: {e}")
 
@@ -138,9 +136,9 @@ def add_log(msg):
     STATE["logs"] = STATE["logs"][:100]
 
 
-def gate_sign(method, url, query_string="", body_string=""):
-    key = STATE.get("api_key", "").strip()
-    secret = STATE.get("api_secret", "").strip()
+def gate_sign(method, url, query_string="", body_string="", custom_key=None, custom_secret=None):
+    key = (custom_key if custom_key is not None else STATE.get("api_key", "")).strip()
+    secret = (custom_secret if custom_secret is not None else STATE.get("api_secret", "")).strip()
     t = str(int(time.time()))
     hashed_payload = hashlib.sha512(body_string.encode("utf-8")).hexdigest()
     s = f"{method}\n{url}\n{query_string}\n{hashed_payload}\n{t}"
@@ -163,7 +161,7 @@ def get_pair_meta(pair):
             timeout=5
         )
         if p_resp.status_code != 200:
-            raise ValueError(f"Token pair '{pair}' does not exist on Gate.io")
+            raise ValueError(f"Token pair '{pair}' not found on Gate.io")
         p_info = p_resp.json()
         cached = {
             "amount_prec": int(p_info.get("amount_precision", 4)),
@@ -177,7 +175,8 @@ def get_pair_meta(pair):
 
 
 def fetch_batch_tickers(pairs):
-    """Fetches all tickers in ONE fast HTTP request (~150ms total for 10+ tokens)."""
+    if not pairs:
+        return {}
     r = HTTP_SESSION.get(f"{GATE_HOST}{GATE_PREFIX}/spot/tickers", timeout=6)
     r.raise_for_status()
     all_data = r.json()
@@ -196,11 +195,16 @@ def fetch_batch_tickers(pairs):
     return result
 
 
-def fetch_all_spot_balances():
+def fetch_all_spot_balances(custom_key=None, custom_secret=None):
     url = f"{GATE_PREFIX}/spot/accounts"
-    headers = gate_sign("GET", url, "", "")
+    headers = gate_sign("GET", url, "", "", custom_key, custom_secret)
     r = HTTP_SESSION.get(f"{GATE_HOST}{url}", headers=headers, timeout=5)
-    r.raise_for_status()
+    if r.status_code != 200:
+        try:
+            err_msg = r.json().get("message", r.text)
+        except Exception:
+            err_msg = r.text
+        raise ValueError(f"Gate.io HTTP {r.status_code}: {err_msg}")
     accounts = r.json()
     bal_map = {}
     for acc in accounts:
@@ -240,7 +244,7 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
 
     tk = ticker_map.get(pair)
     if not tk:
-        raise ValueError(f"Pair {pair} not in ticker feed")
+        raise ValueError(f"Pair {pair} not found on Gate.io")
 
     meta = get_pair_meta(pair)
     price = tk["last"]
@@ -354,7 +358,7 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
     # LIVE GATE.IO CASH MODE
     # =========================================================================
     if not has_keys:
-        slot["status_msg"] = "[LIVE] Paste Gate.io API Keys below & click Save"
+        slot["status_msg"] = "[LIVE] Connect Gate.io API Keys above first"
         return
 
     real_base_bal = bal_map.get(base_curr, 0.0)
@@ -479,26 +483,35 @@ def run_fleet_cycle(force_manual=False):
             has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
             slot_keys = list(STATE["slots"].keys())
 
+        bal_map = {}
+        if has_keys:
+            try:
+                bal_map = fetch_all_spot_balances()
+                with state_lock:
+                    STATE["api_connected"] = True
+                    STATE["usdt_balance"] = bal_map.get("USDT", 0.0)
+                    STATE["api_status_msg"] = f"Connected to Gate.io v4 (Available: ${STATE['usdt_balance']:.2f} USDT)"
+            except Exception as e:
+                with state_lock:
+                    STATE["api_connected"] = False
+                    STATE["api_status_msg"] = f"Auth Error: {str(e)[:55]}"
+                if mode == "LIVE":
+                    add_log(f"Gate.io API Key Error: {str(e)[:60]}")
+
+        if not slot_keys:
+            with state_lock:
+                STATE["cycle_count"] = STATE.get("cycle_count", 0) + 1
+                STATE["last_worker_heartbeat"] = time.time()
+                STATE["last_scan_ms"] = int((time.time() - t0) * 1000)
+                STATE["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
+            return
+
         ticker_map = {}
         try:
             ticker_map = fetch_batch_tickers(slot_keys)
         except Exception as tk_err:
             add_log(f"Ticker batch notice: {str(tk_err)[:60]}")
             return
-
-        bal_map = {}
-        if has_keys:
-            try:
-                bal_map = fetch_all_spot_balances()
-            except Exception as e:
-                if mode == "LIVE":
-                    add_log(f"Gate.io API Key Error: {str(e)[:60]}")
-
-        with state_lock:
-            if has_keys:
-                STATE["usdt_balance"] = bal_map.get("USDT", 0.0)
-            else:
-                STATE["usdt_balance"] = sum(float(s["principal_usdt"]) for s in STATE["slots"].values())
 
         for pair in slot_keys:
             with state_lock:
@@ -524,7 +537,7 @@ def run_fleet_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("VaultSkimmer v5.1 Live-Safe Multi-Token Engine Online.")
+    add_log("VaultSkimmer v5.2 Clean Engine Ready — Waiting for your commands.")
     while True:
         run_fleet_cycle(force_manual=False)
         time.sleep(3.0)
@@ -564,9 +577,9 @@ def app_icon():
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
-        "name": "VaultSkimmer v5.1 Live-Safe Fleet",
+        "name": "VaultSkimmer v5.2 Command Fleet",
         "short_name": "VaultSkimmer",
-        "description": "Multi-Token +1% Spot Skimmer & Auto-Rebuy Fleet Engine",
+        "description": "Zero-Hardcode Multi-Token +1% Spot Skimmer",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#060b16",
@@ -589,7 +602,7 @@ def service_worker():
 
 @app.route("/ping")
 def ping():
-    return jsonify({"ok": True, "service": "VaultSkimmer-v5.1", "cycle": STATE["cycle_count"]})
+    return jsonify({"ok": True, "service": "VaultSkimmer-v5.2", "cycle": STATE["cycle_count"]})
 
 
 @app.route("/api/cron")
@@ -617,9 +630,56 @@ def api_state():
         run_fleet_cycle(force_manual=False)
     with state_lock:
         safe = STATE.copy()
-        safe["api_key"] = "Saved on server" if STATE.get("api_key") else ""
-        safe["api_secret"] = "Saved on server" if STATE.get("api_secret") else ""
+        safe["has_saved_keys"] = bool(STATE.get("api_key") and STATE.get("api_secret"))
+        safe["api_key"] = ""
+        safe["api_secret"] = ""
         return jsonify(safe)
+
+
+# =========================================================================
+# DEDICATED GATE.IO API KEY SYNC & LIVE CONNECTION TEST ENDPOINT
+# =========================================================================
+@app.route("/api/sync_keys", methods=["POST"])
+def api_sync_keys():
+    data = request.json or {}
+    new_key = (data.get("api_key") or "").strip()
+    new_secret = (data.get("api_secret") or "").strip()
+
+    with state_lock:
+        if new_key:
+            STATE["api_key"] = new_key
+        if new_secret:
+            STATE["api_secret"] = new_secret
+        active_key = STATE.get("api_key", "")
+        active_secret = STATE.get("api_secret", "")
+
+    if not active_key or not active_secret:
+        with state_lock:
+            STATE["api_connected"] = False
+            STATE["api_status_msg"] = "Missing API Key or Secret — Please paste both."
+            save_state()
+        return jsonify({"ok": False, "error": "Please enter both your Gate.io API Key and Secret."}), 400
+
+    try:
+        bal_map = fetch_all_spot_balances(active_key, active_secret)
+        usdt_avail = bal_map.get("USDT", 0.0)
+        non_zero = [f"{k}: {v:.4f}" for k, v in bal_map.items() if v > 0][:6]
+        summary = ", ".join(non_zero) if non_zero else "0.00 USDT"
+        with state_lock:
+            STATE["api_connected"] = True
+            STATE["usdt_balance"] = usdt_avail
+            STATE["api_status_msg"] = f"Verified & Connected! Gate.io USDT: ${usdt_avail:.2f}"
+            add_log(f"🔗 Gate.io API Keys Synced & Verified! Balances: {summary}")
+            save_state()
+        return jsonify({"ok": True, "usdt_balance": usdt_avail, "status_msg": STATE["api_status_msg"]})
+    except Exception as e:
+        err_str = str(e)[:80]
+        with state_lock:
+            STATE["api_connected"] = False
+            STATE["api_status_msg"] = f"Connection Failed: {err_str}"
+            add_log(f"❌ Gate.io API Sync Failed: {err_str}")
+            save_state()
+        return jsonify({"ok": False, "error": err_str}), 400
 
 
 @app.route("/api/add_or_update_slot", methods=["POST"])
@@ -627,20 +687,25 @@ def api_add_or_update_slot():
     data = request.json or {}
     pair = normalize_pair(data.get("pair", ""))
     if not pair:
-        return jsonify({"ok": False, "error": "Pair required"}), 400
+        return jsonify({"ok": False, "error": "Please enter a Token Symbol first."}), 400
 
-    principal = max(1.0, float(data.get("principal_usdt") or 10.0))
-    skim_pct = max(0.1, float(data.get("skim_target_pct") or 1.0))
-    pullback_pct = max(0.0, float(data.get("rebuy_pullback_pct") or 0.0))
+    raw_prin = str(data.get("principal_usdt") or "").strip()
+    if not raw_prin or float(raw_prin) <= 0:
+        return jsonify({"ok": False, "error": "Please enter a valid Slot Protected Principal (USDT)."}), 400
+
+    raw_skim = str(data.get("skim_target_pct") or "").strip()
+    if not raw_skim or float(raw_skim) <= 0:
+        return jsonify({"ok": False, "error": "Please enter a Skim Profit Target % (e.g. 1)."}), 400
+
+    principal = max(1.0, float(raw_prin))
+    skim_pct = max(0.1, float(raw_skim))
+    raw_pb = str(data.get("rebuy_pullback_pct") or "").strip()
+    pullback_pct = max(0.0, float(raw_pb)) if raw_pb else 0.0
+
     raw_ep = str(data.get("entry_price") or "").strip()
     custom_ep = float(raw_ep) if (raw_ep and float(raw_ep) > 0) else 0.0
 
     with state_lock:
-        if data.get("api_key") and data["api_key"] != "Saved on server":
-            STATE["api_key"] = data["api_key"].strip()
-        if data.get("api_secret") and data["api_secret"] != "Saved on server":
-            STATE["api_secret"] = data["api_secret"].strip()
-
         existing = STATE["slots"].get(pair)
         if existing:
             if existing["principal_usdt"] != principal and STATE["mode"] == "PAPER":
@@ -651,10 +716,10 @@ def api_add_or_update_slot():
             existing["rebuy_pullback_pct"] = pullback_pct
             if custom_ep > 0:
                 existing["entry_price"] = custom_ep
-            add_log(f"Updated Slot: {pair} | Principal: ${principal:.2f} | Skim: +{skim_pct}%")
+            add_log(f"Updated Command Slot: {pair} | Principal: ${principal:.2f} | Skim: +{skim_pct}%")
         else:
             STATE["slots"][pair] = make_slot(pair, principal, skim_pct, pullback_pct, custom_ep)
-            add_log(f"Added Token to Fleet: {pair} (${principal:.2f} Base @ +{skim_pct}% Skim)")
+            add_log(f"Commanded New Token Slot: {pair} (${principal:.2f} Base @ +{skim_pct}% Skim)")
 
         save_state()
 
@@ -667,10 +732,20 @@ def api_remove_slot():
     data = request.json or {}
     pair = normalize_pair(data.get("pair", ""))
     with state_lock:
-        if pair in STATE["slots"] and len(STATE["slots"]) > 1:
+        # Allow removing ANY slot, even the very last one, so the fleet can be 100% empty
+        if pair in STATE["slots"]:
             del STATE["slots"][pair]
-            add_log(f"Removed {pair} from active fleet.")
+            add_log(f"Removed {pair} from fleet ({len(STATE['slots'])} active slots remaining).")
             save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/clear_all_slots", methods=["POST"])
+def api_clear_all_slots():
+    with state_lock:
+        STATE["slots"] = {}
+        add_log("🧹 Cleared all token slots — System is now 100% empty and standing by.")
+        save_state()
     return jsonify({"ok": True})
 
 
@@ -695,7 +770,6 @@ def api_toggle_mode():
     with state_lock:
         new_mode = "LIVE" if STATE.get("mode") == "PAPER" else "PAPER"
         STATE["mode"] = new_mode
-        # Reset paper entry floors & per-slot counters when switching to LIVE so real cash starts clean
         for sl in STATE["slots"].values():
             sl["entry_price"] = 0.0
             sl["slot_skimmed_usdt"] = 0.0
@@ -717,7 +791,7 @@ HTML_UI = """
   <meta name="theme-color" content="#060b16" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/svg+xml" href="/icon.svg" />
-  <title>VaultSkimmer v5.1 | Live-Safe Multi-Token Fleet</title>
+  <title>VaultSkimmer v5.2 | Zero-Hardcode Command Engine</title>
   <style>
     :root {
       --bg: #050811;
@@ -728,6 +802,7 @@ HTML_UI = """
       --cyan: #06b6d4;
       --amber: #f59e0b;
       --purple: #8b5cf6;
+      --danger: #ef4444;
       --text: #f8fafc;
       --muted: #94a3b8;
     }
@@ -786,8 +861,26 @@ HTML_UI = """
     .c-cyan { color: #22d3ee; }
     .c-amber { color: #fbbf24; }
 
-    .fleet-header { font-size: 0.88rem; font-weight: 900; text-transform: uppercase; color: #38bdf8; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+    /* Dedicated API Sync Panel */
+    .api-card {
+      background: linear-gradient(135deg, rgba(13, 20, 36, 0.96), rgba(15, 29, 58, 0.88));
+      border: 1px solid #263554; border-radius: 15px; padding: 15px 18px; margin-bottom: 16px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    }
+    .api-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; margin-bottom: 11px; gap: 8px; }
+    .api-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; align-items: end; }
+    .btn-sync-api {
+      background: linear-gradient(135deg, #06b6d4, #10b981); color: #022c22;
+      font-weight: 900; font-size: 0.84rem; padding: 11px 16px; border-radius: 10px; border: none;
+      cursor: pointer; width: 100%; box-shadow: 0 0 15px rgba(6,182,212,0.28);
+    }
+
+    .fleet-header { font-size: 0.88rem; font-weight: 900; text-transform: uppercase; color: #38bdf8; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
     .fleet-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .empty-fleet {
+      background: rgba(13, 20, 36, 0.65); border: 1px dashed #334155; border-radius: 15px;
+      padding: 28px 18px; text-align: center; color: var(--muted); font-size: 0.85rem; margin-bottom: 16px;
+    }
     .slot-card {
       background: linear-gradient(180deg, rgba(16, 26, 48, 0.95), rgba(10, 15, 29, 0.95));
       border: 1px solid #263554; border-radius: 15px; padding: 14px 16px;
@@ -835,8 +928,8 @@ HTML_UI = """
   <div class="hero">
     <div class="hero-top">
       <div>
-        <div class="brand-title">VaultSkimmer <span class="v-badge">v5.1 LIVE-READY FLEET</span></div>
-        <div class="sub-desc">8-Decimal Micro-Token Precision • Single-Batch High-Speed Ticker • Separate Paper & Live Cash Ledgers</div>
+        <div class="brand-title">VaultSkimmer <span class="v-badge">v5.2 ZERO-HARDCODE</span></div>
+        <div class="sub-desc">100% Blank Until Commanded • Dedicated Gate.io API Key Sync • Independent +1% Skim & Auto-Rebuy</div>
       </div>
       <div class="top-actions">
         <button class="btn-install" onclick="triggerInstall()">📲 Install App</button>
@@ -848,24 +941,45 @@ HTML_UI = """
       <div>
         <span id="modePill" class="pill pill-paper"><span class="dot"></span> <span id="modeText">PAPER SIM FLEET</span></span>
       </div>
-      <div>Active Tokens Running: <strong class="c-cyan" id="activeCount">2</strong></div>
+      <div>Active Tokens Running: <strong class="c-cyan" id="activeCount">0</strong></div>
       <div>Last Fleet Scan: <strong id="lastUpdate">--:--:--</strong> (<strong class="c-green" id="scanMs">0</strong>ms | Cycle #<span id="cycleNum">0</span>)</div>
+    </div>
+  </div>
+
+  <!-- DEDICATED GATE.IO API KEY CONNECTION PANEL -->
+  <div class="api-card">
+    <div class="api-header">
+      <div class="sec-title" style="margin-bottom:0;">🔑 Gate.io v4 API Connection & Live Wallet Sync</div>
+      <div id="apiBadge" style="font-size:0.78rem; font-weight:800; color:var(--amber);">● Not Connected</div>
+    </div>
+    <div class="api-grid">
+      <div>
+        <label>Gate.io v4 API Key</label>
+        <input type="password" id="apiKeyInput" placeholder="Paste your Gate.io API Key..." autocomplete="off" />
+      </div>
+      <div>
+        <label>Gate.io v4 API Secret</label>
+        <input type="password" id="apiSecretInput" placeholder="Paste your Gate.io API Secret..." autocomplete="off" />
+      </div>
+      <div>
+        <button class="btn-sync-api" onclick="syncApiKeys()" id="syncApiBtn">🔗 Sync & Verify Gate.io API Keys</button>
+      </div>
     </div>
   </div>
 
   <div class="grid-4">
     <div class="card">
       <div class="lbl">Total Protected Principal (All Slots)</div>
-      <div class="val c-cyan" id="totalPrincipal">$20.00</div>
-      <div class="sub">Active Fleet Value: <strong id="totalPosVal">$20.0000</strong></div>
+      <div class="val c-cyan" id="totalPrincipal">$0.00</div>
+      <div class="sub">Active Fleet Value: <strong id="totalPosVal">$0.0000</strong></div>
     </div>
     <div class="card">
       <div class="lbl">Active Tokens in Fleet</div>
-      <div class="val" id="fleetListText">QNT, SUI</div>
-      <div class="sub">All slots protected by Entry Floor</div>
+      <div class="val" id="fleetListText">None</div>
+      <div class="sub">Empty until you command a token</div>
     </div>
     <div class="card">
-      <div class="lbl" id="vaultTitleLbl">Realized LIVE Cash Profit Vault</div>
+      <div class="lbl">Realized LIVE Cash Profit Vault</div>
       <div class="val c-green" id="liveSkimmed">+$0.0000</div>
       <div class="sub">Live Skims Won: <strong id="liveSkimCount">0</strong> | Gate.io USDT: <strong id="usdtBal">$0.00</strong></div>
     </div>
@@ -877,66 +991,59 @@ HTML_UI = """
   </div>
 
   <div class="fleet-header">
-    <span>🚀 Active Multi-Token Skimmer Fleet (Live Parallel Slots)</span>
+    <span>🚀 Active Multi-Token Skimmer Fleet</span>
+    <button class="s-btn s-btn-del" onclick="clearAllSlots()" id="clearAllBtn" style="display:none;">🧹 Clear All Slots</button>
   </div>
-  <div class="fleet-grid" id="fleetGrid"></div>
+  <div id="fleetContainer">
+    <div class="empty-fleet">No tokens running — Everything is 100% empty until you command a token below.</div>
+  </div>
 
   <div class="grid-2">
     <div class="card">
-      <div class="sec-title">➕ Add New Token to Fleet / Update Existing Slot</div>
+      <div class="sec-title">➕ Command New Token Slot / Edit Existing Slot</div>
 
-      <label>1-Click Add Top 1% Skim Tokens to Fleet:</label>
+      <label>Tap a Ticker to Fill Symbol Box (Does Not Auto-Run Until You Command):</label>
       <div class="chip-bar">
-        <span class="chip" onclick="quickAdd('SUI_USDT')">+ SUI</span>
-        <span class="chip" onclick="quickAdd('QNT_USDT')">+ QNT</span>
-        <span class="chip" onclick="quickAdd('SOL_USDT')">+ SOL</span>
-        <span class="chip" onclick="quickAdd('HYPE_USDT')">+ HYPE</span>
-        <span class="chip" onclick="quickAdd('PEPE_USDT')">+ PEPE</span>
-        <span class="chip" onclick="quickAdd('TAO_USDT')">+ TAO</span>
-        <span class="chip" onclick="quickAdd('LINK_USDT')">+ LINK</span>
-        <span class="chip" onclick="quickAdd('DOGE_USDT')">+ DOGE</span>
-        <span class="chip" onclick="quickAdd('AAVE_USDT')">+ AAVE</span>
-        <span class="chip" onclick="quickAdd('NEAR_USDT')">+ NEAR</span>
+        <span class="chip" onclick="fillTicker('SUI_USDT')">SUI</span>
+        <span class="chip" onclick="fillTicker('QNT_USDT')">QNT</span>
+        <span class="chip" onclick="fillTicker('SOL_USDT')">SOL</span>
+        <span class="chip" onclick="fillTicker('HYPE_USDT')">HYPE</span>
+        <span class="chip" onclick="fillTicker('PEPE_USDT')">PEPE</span>
+        <span class="chip" onclick="fillTicker('TAO_USDT')">TAO</span>
+        <span class="chip" onclick="fillTicker('LINK_USDT')">LINK</span>
+        <span class="chip" onclick="fillTicker('DOGE_USDT')">DOGE</span>
+        <span class="chip" onclick="fillTicker('AAVE_USDT')">AAVE</span>
+        <span class="chip" onclick="fillTicker('NEAR_USDT')">NEAR</span>
       </div>
 
       <div class="row">
         <div>
           <label>Token Symbol (Type Any Gate.io Coin)</label>
-          <input type="text" id="pairInput" placeholder="e.g. QNT, SUI, PEPE, SOL" value="SUI_USDT" />
+          <input type="text" id="pairInput" placeholder="e.g. SUI, QNT, PEPE, BTC" value="" autocomplete="off" />
         </div>
         <div>
           <label>Slot Protected Principal (USDT)</label>
-          <input type="number" id="principalInput" step="0.5" value="10" />
+          <input type="number" id="principalInput" step="0.5" placeholder="Enter USDT amount..." value="" autocomplete="off" />
         </div>
       </div>
       <div class="row">
         <div>
           <label>Skim Profit Target (%)</label>
-          <input type="number" id="skimPctInput" step="0.1" value="1.0" />
+          <input type="number" id="skimPctInput" step="0.1" placeholder="Enter % (e.g. 1.0)" value="" autocomplete="off" />
         </div>
         <div>
-          <label>Rebuy Pullback % (0 = Instant)</label>
-          <input type="number" id="pullbackInput" step="0.05" value="0.0" />
-        </div>
-      </div>
-      <div class="row">
-        <div>
-          <label>Custom Entry Floor ($ - Leave Blank for Auto)</label>
-          <input type="number" id="entryInput" step="0.00000001" placeholder="Auto-locks live price" />
-        </div>
-        <div>
-          <label>Gate.io v4 API Key (For Live Mode)</label>
-          <input type="password" id="apiKeyInput" placeholder="Saved on server" />
+          <label>Rebuy Pullback % (Optional — Blank = 0%)</label>
+          <input type="number" id="pullbackInput" step="0.05" placeholder="0 = Instant Rebuy" value="" autocomplete="off" />
         </div>
       </div>
       <div class="row">
         <div style="grid-column: span 2;">
-          <label>Gate.io v4 API Secret (For Live Mode)</label>
-          <input type="password" id="apiSecretInput" placeholder="Saved on server" />
+          <label>Custom Entry Floor ($ — Leave Blank to Auto-Lock Live Price)</label>
+          <input type="number" id="entryInput" step="0.00000001" placeholder="Leave blank for automatic live entry price" value="" autocomplete="off" />
         </div>
       </div>
       <div class="btns">
-        <button class="ctrl b-save" onclick="addOrUpdateSlot()" id="saveBtn">➕ Add / Save Token Slot</button>
+        <button class="ctrl b-save" onclick="addOrUpdateSlot()" id="saveBtn">➕ Command & Launch Token Slot</button>
         <button class="ctrl b-arm" onclick="toggleMode()">🔀 Switch Fleet PAPER / LIVE</button>
       </div>
     </div>
@@ -955,7 +1062,7 @@ HTML_UI = """
             </tr>
           </thead>
           <tbody id="ledgerBody">
-            <tr><td colspan="5" style="color:#64748b; text-align:center; padding:22px;">Waiting for any token in your fleet to hit +1% above its Entry Floor.</td></tr>
+            <tr><td colspan="5" style="color:#64748b; text-align:center; padding:22px;">Waiting for commanded tokens to hit +1% above Entry Floor.</td></tr>
           </tbody>
         </table>
       </div>
@@ -991,8 +1098,12 @@ HTML_UI = """
       deferredPrompt.prompt();
       deferredPrompt = null;
     } else {
-      alert('App is already installed on your phone!');
+      alert('App is already installed or available via your browser menu!');
     }
+  }
+
+  function fillTicker(pair) {
+    document.getElementById('pairInput').value = pair;
   }
 
   function loadSlotToForm(pair, principal, skimPct, pullback) {
@@ -1003,33 +1114,71 @@ HTML_UI = """
     document.getElementById('entryInput').value = '';
   }
 
-  async function quickAdd(pair) {
-    document.getElementById('pairInput').value = pair;
-    document.getElementById('entryInput').value = '';
-    await addOrUpdateSlot();
+  async function syncApiKeys() {
+    const btn = document.getElementById('syncApiBtn');
+    const keyVal = document.getElementById('apiKeyInput').value.trim();
+    const secretVal = document.getElementById('apiSecretInput').value.trim();
+    btn.innerText = 'Verifying with Gate.io...';
+
+    const r = await fetch('/api/sync_keys', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ api_key: keyVal, api_secret: secretVal })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('apiKeyInput').value = '';
+      document.getElementById('apiSecretInput').value = '';
+      document.getElementById('apiKeyInput').placeholder = 'Saved & Verified on Server';
+      document.getElementById('apiSecretInput').placeholder = 'Saved & Verified on Server';
+      btn.innerText = '✅ Connected ($' + Number(d.usdt_balance).toFixed(2) + ' USDT)';
+    } else {
+      alert('Gate.io API Error: ' + (d.error || 'Check your Key & Secret'));
+      btn.innerText = '❌ Sync Failed — Retry';
+    }
+    await refresh();
+    setTimeout(() => { btn.innerText = '🔗 Sync & Verify Gate.io API Keys'; }, 2500);
   }
 
   async function addOrUpdateSlot() {
+    const pair = document.getElementById('pairInput').value.trim();
+    const prin = document.getElementById('principalInput').value.trim();
+    const skim = document.getElementById('skimPctInput').value.trim();
+    const pb = document.getElementById('pullbackInput').value.trim();
+    const ep = document.getElementById('entryInput').value.trim();
+
+    if (!pair || !prin || !skim) {
+      alert('Please enter Token Symbol, Protected Principal (USDT), and Skim Profit Target (%) first.');
+      return;
+    }
+
     const btn = document.getElementById('saveBtn');
-    btn.innerText = 'Syncing Slot...';
-    const payload = {
-      pair: document.getElementById('pairInput').value,
-      principal_usdt: parseFloat(document.getElementById('principalInput').value || 10),
-      skim_target_pct: parseFloat(document.getElementById('skimPctInput').value || 1.0),
-      rebuy_pullback_pct: parseFloat(document.getElementById('pullbackInput').value || 0.0),
-      entry_price: document.getElementById('entryInput').value,
-      api_key: document.getElementById('apiKeyInput').value,
-      api_secret: document.getElementById('apiSecretInput').value
-    };
-    await fetch('/api/add_or_update_slot', {
+    btn.innerText = 'Commanding Slot...';
+    const r = await fetch('/api/add_or_update_slot', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        pair: pair,
+        principal_usdt: prin,
+        skim_target_pct: skim,
+        rebuy_pullback_pct: pb,
+        entry_price: ep
+      })
     });
+    const d = await r.json();
+    if (!d.ok) {
+      alert(d.error || 'Could not add slot');
+      btn.innerText = '➕ Command & Launch Token Slot';
+      return;
+    }
+    document.getElementById('pairInput').value = '';
+    document.getElementById('principalInput').value = '';
+    document.getElementById('skimPctInput').value = '';
+    document.getElementById('pullbackInput').value = '';
     document.getElementById('entryInput').value = '';
     await refresh();
-    btn.innerText = '✅ Slot Active!';
-    setTimeout(() => { btn.innerText = '➕ Add / Save Token Slot'; }, 1000);
+    btn.innerText = '✅ Slot Launched!';
+    setTimeout(() => { btn.innerText = '➕ Command & Launch Token Slot'; }, 1000);
   }
 
   async function removeSlot(pair) {
@@ -1038,6 +1187,11 @@ HTML_UI = """
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ pair })
     });
+    await refresh();
+  }
+
+  async function clearAllSlots() {
+    await fetch('/api/clear_all_slots', { method: 'POST' });
     await refresh();
   }
 
@@ -1072,10 +1226,24 @@ HTML_UI = """
       document.getElementById('scanMs').innerText = s.last_scan_ms;
       document.getElementById('cycleNum').innerText = s.cycle_count || 0;
 
+      const apiBadge = document.getElementById('apiBadge');
+      if (s.api_connected) {
+        apiBadge.style.color = '#34d399';
+        apiBadge.innerText = '● ' + (s.api_status_msg || 'Connected to Gate.io');
+      } else {
+        apiBadge.style.color = '#fbbf24';
+        apiBadge.innerText = '● ' + (s.api_status_msg || 'Not Connected');
+      }
+      if (s.has_saved_keys && !document.getElementById('apiKeyInput').value) {
+        document.getElementById('apiKeyInput').placeholder = 'Saved on Server (Paste new to replace)';
+        document.getElementById('apiSecretInput').placeholder = 'Saved on Server (Paste new to replace)';
+      }
+
       const slots = s.slots || {};
       const keys = Object.keys(slots);
       document.getElementById('activeCount').innerText = keys.length;
-      document.getElementById('fleetListText').innerText = keys.map(k => k.split('_')[0]).join(', ');
+      document.getElementById('fleetListText').innerText = keys.length > 0 ? keys.map(k => k.split('_')[0]).join(', ') : 'None';
+      document.getElementById('clearAllBtn').style.display = keys.length > 0 ? 'inline-block' : 'none';
 
       const pill = document.getElementById('modePill');
       const modeText = document.getElementById('modeText');
@@ -1091,53 +1259,59 @@ HTML_UI = """
       let sumPosVal = 0;
       const needBuf = Number(s.fee_buffer_pct || 0.2);
 
-      const cardsHtml = keys.map(pair => {
-        const sl = slots[pair];
-        const p = Number(sl.principal_usdt || 10);
-        const pos = Number(sl.position_value_usdt || 0);
-        const skimPct = Number(sl.skim_target_pct || 1.0);
-        sumPrincipal += p;
-        sumPosVal += pos;
-
-        const needPct = skimPct + needBuf;
-        const prog = Math.max(0, Math.min(100, (Number(sl.unrealized_pnl_pct || 0) / needPct) * 100));
-        const pnlSign = sl.unrealized_pnl_pct >= 0 ? '+' : '';
-
-        return `
-          <div class="slot-card">
-            <div class="slot-top">
-              <div class="slot-pair">
-                <span>${pair}</span>
-                <span class="slot-badge">$${p.toFixed(2)} Base</span>
-              </div>
-              <div style="font-size:0.78rem; font-weight:800;" class="${sl.unrealized_pnl_pct >= 0 ? 'c-green' : 'c-amber'}">
-                Live: ${fmtPx(sl.last_price)} (${pnlSign}${Number(sl.unrealized_pnl_pct).toFixed(2)}%)
-              </div>
-            </div>
-
-            <div class="slot-metrics">
-              <div>Entry Floor: <strong>${fmtPx(sl.entry_price)}</strong></div>
-              <div>+1% Target: <strong class="c-cyan">${fmtPx(sl.target_sell_price)}</strong></div>
-              <div>Position: <strong>$${pos.toFixed(4)}</strong></div>
-              <div>Slot Vaulted: <strong class="c-green">+$${Number(sl.slot_skimmed_usdt || 0).toFixed(4)} (${sl.slot_skim_count || 0})</strong></div>
-            </div>
-
-            <div style="display:flex; justify-content:space-between; font-size:0.73rem; color:var(--muted);">
-              <span>${sl.status_msg}</span>
-              <strong class="c-green">${prog.toFixed(1)}%</strong>
-            </div>
-            <div class="track"><div class="fill" style="width:${prog.toFixed(1)}%"></div></div>
-
-            <div class="slot-actions">
-              <button class="s-btn" onclick="loadSlotToForm('${pair}', ${p}, ${skimPct}, ${sl.rebuy_pullback_pct || 0})">✏️ Edit Slot</button>
-              <button class="s-btn" onclick="resetSlotEntry('${pair}')">🔄 Sync Entry</button>
-              ${keys.length > 1 ? `<button class="s-btn s-btn-del" onclick="removeSlot('${pair}')">🗑️ Remove</button>` : ''}
-            </div>
-          </div>
+      if (keys.length === 0) {
+        document.getElementById('fleetContainer').innerHTML = `
+          <div class="empty-fleet">No tokens running — Everything is 100% empty until you command a token below.</div>
         `;
-      }).join('');
+      } else {
+        const cardsHtml = keys.map(pair => {
+          const sl = slots[pair];
+          const p = Number(sl.principal_usdt || 0);
+          const pos = Number(sl.position_value_usdt || 0);
+          const skimPct = Number(sl.skim_target_pct || 1.0);
+          sumPrincipal += p;
+          sumPosVal += pos;
 
-      document.getElementById('fleetGrid').innerHTML = cardsHtml;
+          const needPct = skimPct + needBuf;
+          const prog = Math.max(0, Math.min(100, (Number(sl.unrealized_pnl_pct || 0) / needPct) * 100));
+          const pnlSign = sl.unrealized_pnl_pct >= 0 ? '+' : '';
+
+          return `
+            <div class="slot-card">
+              <div class="slot-top">
+                <div class="slot-pair">
+                  <span>${pair}</span>
+                  <span class="slot-badge">$${p.toFixed(2)} Base</span>
+                </div>
+                <div style="font-size:0.78rem; font-weight:800;" class="${sl.unrealized_pnl_pct >= 0 ? 'c-green' : 'c-amber'}">
+                  Live: ${fmtPx(sl.last_price)} (${pnlSign}${Number(sl.unrealized_pnl_pct).toFixed(2)}%)
+                </div>
+              </div>
+
+              <div class="slot-metrics">
+                <div>Entry Floor: <strong>${fmtPx(sl.entry_price)}</strong></div>
+                <div>+${skimPct}% Target: <strong class="c-cyan">${fmtPx(sl.target_sell_price)}</strong></div>
+                <div>Position: <strong>$${pos.toFixed(4)}</strong></div>
+                <div>Slot Vaulted: <strong class="c-green">+$${Number(sl.slot_skimmed_usdt || 0).toFixed(4)} (${sl.slot_skim_count || 0})</strong></div>
+              </div>
+
+              <div style="display:flex; justify-content:space-between; font-size:0.73rem; color:var(--muted);">
+                <span>${sl.status_msg}</span>
+                <strong class="c-green">${prog.toFixed(1)}%</strong>
+              </div>
+              <div class="track"><div class="fill" style="width:${prog.toFixed(1)}%"></div></div>
+
+              <div class="slot-actions">
+                <button class="s-btn" onclick="loadSlotToForm('${pair}', ${p}, ${skimPct}, ${sl.rebuy_pullback_pct || 0})">✏️ Edit Slot</button>
+                <button class="s-btn" onclick="resetSlotEntry('${pair}')">🔄 Sync Entry</button>
+                <button class="s-btn s-btn-del" onclick="removeSlot('${pair}')">🗑️ Remove</button>
+              </div>
+            </div>
+          `;
+        }).join('');
+        document.getElementById('fleetContainer').innerHTML = `<div class="fleet-grid">${cardsHtml}</div>`;
+      }
+
       document.getElementById('totalPrincipal').innerText = '$' + sumPrincipal.toFixed(2);
       document.getElementById('totalPosVal').innerText = '$' + sumPosVal.toFixed(4);
       document.getElementById('liveSkimmed').innerText = '+$' + Number(s.live_skimmed_usdt || 0).toFixed(4);
