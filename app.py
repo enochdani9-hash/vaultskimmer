@@ -7,13 +7,27 @@ import threading
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 import requests
-from flask import Flask, request, jsonify, render_template_string
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "vaultskimmer_v2_state.json"
+STATE_FILE = "vaultskimmer_v3_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
+
+# Persistent high-speed HTTP Session (reuses SSL/TCP connections for ultra-smooth cycles)
+HTTP_SESSION = requests.Session()
+adapter = HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=10,
+    max_retries=Retry(total=2, backoff_factor=0.2, status_forcelist=[502, 503, 504])
+)
+HTTP_SESSION.mount("https://", adapter)
+
+# Cache pair precision metadata so we don't re-fetch static pair rules every 3 seconds
+PAIR_META_CACHE = {}
 
 DEFAULT_STATE = {
     "armed": False,
@@ -21,15 +35,18 @@ DEFAULT_STATE = {
     "principal_usdt": 25.0,
     "skim_target_pct": 1.0,
     "fee_buffer_pct": 0.20,
-    "rebuy_pullback_pct": 0.0,  # 0.0 = Instant rebuy at new price; >0 = wait for micro-pullback
+    "rebuy_pullback_pct": 0.0,
     "entry_price": 0.0,
     "last_skim_sell_price": 0.0,
-    "phase": "WAITING_TO_BUY",  # WAITING_TO_BUY or HOLDING_FOR_SKIM
+    "phase": "WAITING_TO_BUY",
     "api_key": os.environ.get("GATE_API_KEY", ""),
     "api_secret": os.environ.get("GATE_API_SECRET", ""),
     "total_skimmed_usdt": 0.0,
     "skim_count": 0,
     "last_price": 0.0,
+    "high_24h": 0.0,
+    "low_24h": 0.0,
+    "change_24h_pct": 0.0,
     "base_balance": 0.0,
     "usdt_balance": 0.0,
     "position_value_usdt": 0.0,
@@ -37,14 +54,16 @@ DEFAULT_STATE = {
     "target_rebuy_price": 0.0,
     "unrealized_pnl_usdt": 0.0,
     "unrealized_pnl_pct": 0.0,
-    "status_msg": "STANDBY - Set Principal & Arm VaultSkimmer",
+    "status_msg": "STANDBY - Configure Principal & Arm Engine",
     "last_scan_ms": 0,
+    "cycle_count": 0,
     "last_update": "--:--:--",
     "skim_ledger": [],
     "logs": []
 }
 
 state_lock = threading.Lock()
+cycle_lock = threading.Lock()  # Prevents overlapping cycles between background worker & cron
 STATE = DEFAULT_STATE.copy()
 
 
@@ -56,13 +75,15 @@ def load_state():
                 saved = json.load(f)
                 STATE.update(saved)
         except Exception as e:
-            add_log(f"State load warning: {e}")
+            add_log(f"State load notice: {e}")
 
 
 def save_state():
     try:
-        with open(STATE_FILE, "w") as f:
+        tmp_file = STATE_FILE + ".tmp"
+        with open(tmp_file, "w") as f:
             json.dump(STATE, f, indent=2)
+        os.replace(tmp_file, STATE_FILE)
     except Exception:
         pass
 
@@ -71,16 +92,14 @@ def add_log(msg):
     ts = datetime.utcnow().strftime("%H:%M:%S")
     entry = f"[{ts}] {msg}"
     STATE["logs"].insert(0, entry)
-    STATE["logs"] = STATE["logs"][:80]
+    STATE["logs"] = STATE["logs"][:90]
 
 
 def gate_sign(method, url, query_string="", body_string=""):
     key = STATE.get("api_key", "").strip()
     secret = STATE.get("api_secret", "").strip()
     t = str(int(time.time()))
-    m = hashlib.sha512()
-    m.update(body_string.encode("utf-8"))
-    hashed_payload = m.hexdigest()
+    hashed_payload = hashlib.sha512(body_string.encode("utf-8")).hexdigest()
     s = f"{method}\n{url}\n{query_string}\n{hashed_payload}\n{t}"
     sign = hmac.new(secret.encode("utf-8"), s.encode("utf-8"), hashlib.sha512).hexdigest()
     return {
@@ -92,41 +111,63 @@ def gate_sign(method, url, query_string="", body_string=""):
     }
 
 
-def fetch_ticker_and_pair_info(pair):
-    r = requests.get(
+def fetch_market_snapshot(pair):
+    r = HTTP_SESSION.get(
         f"{GATE_HOST}{GATE_PREFIX}/spot/tickers",
         params={"currency_pair": pair},
-        timeout=6
+        timeout=5
     )
     r.raise_for_status()
     data = r.json()
     if not data:
         raise ValueError(f"Pair {pair} not found on Gate.io")
-    last_price = float(data[0]["last"])
+    t = data[0]
+    last_price = float(t["last"])
+    high_24h = float(t.get("high_24h", last_price))
+    low_24h = float(t.get("low_24h", last_price))
+    change_24h = float(t.get("change_percentage", 0.0))
 
-    p_info = requests.get(
-        f"{GATE_HOST}{GATE_PREFIX}/spot/currency_pairs/{pair}",
-        timeout=6
-    ).json()
-    amount_prec = int(p_info.get("amount_precision", 4))
-    price_prec = int(p_info.get("precision", 4))
-    min_quote = float(p_info.get("min_quote_amount", 1.0))
-    min_base = float(p_info.get("min_base_amount", 0.0001))
-    return last_price, amount_prec, price_prec, min_quote, min_base
+    now = time.time()
+    cached = PAIR_META_CACHE.get(pair)
+    if not cached or (now - cached["ts"] > 3600):
+        p_info = HTTP_SESSION.get(
+            f"{GATE_HOST}{GATE_PREFIX}/spot/currency_pairs/{pair}",
+            timeout=5
+        ).json()
+        cached = {
+            "amount_prec": int(p_info.get("amount_precision", 4)),
+            "price_prec": int(p_info.get("precision", 4)),
+            "min_quote": float(p_info.get("min_quote_amount", 1.0)),
+            "min_base": float(p_info.get("min_base_amount", 0.0001)),
+            "ts": now
+        }
+        PAIR_META_CACHE[pair] = cached
+
+    return (
+        last_price,
+        high_24h,
+        low_24h,
+        change_24h,
+        cached["amount_prec"],
+        cached["price_prec"],
+        cached["min_quote"],
+        cached["min_base"]
+    )
 
 
 def fetch_spot_balances(base_curr):
     url = f"{GATE_PREFIX}/spot/accounts"
     headers = gate_sign("GET", url, "", "")
-    r = requests.get(f"{GATE_HOST}{url}", headers=headers, timeout=6)
+    r = HTTP_SESSION.get(f"{GATE_HOST}{url}", headers=headers, timeout=5)
     r.raise_for_status()
     accounts = r.json()
     base_avail = 0.0
     usdt_avail = 0.0
     for acc in accounts:
-        if acc.get("currency") == base_curr:
+        curr = acc.get("currency")
+        if curr == base_curr:
             base_avail = float(acc.get("available", 0.0))
-        elif acc.get("currency") == "USDT":
+        elif curr == "USDT":
             usdt_avail = float(acc.get("available", 0.0))
     return base_avail, usdt_avail
 
@@ -149,43 +190,49 @@ def place_gate_order(pair, side, amount_str, price_str):
     }
     body_str = json.dumps(body)
     headers = gate_sign("POST", url, "", body_str)
-    r = requests.post(f"{GATE_HOST}{url}", headers=headers, data=body_str, timeout=8)
+    r = HTTP_SESSION.post(f"{GATE_HOST}{url}", headers=headers, data=body_str, timeout=7)
     return r.status_code, r.json()
 
 
-def run_skim_cycle():
-    t0 = time.time()
-    with state_lock:
-        pair = STATE["pair"].strip().upper()
-        base_curr = pair.split("_")[0]
-        principal = float(STATE["principal_usdt"])
-        skim_pct = float(STATE["skim_target_pct"])
-        fee_buf = float(STATE["fee_buffer_pct"])
-        pullback_pct = float(STATE.get("rebuy_pullback_pct", 0.0))
-        armed = bool(STATE["armed"])
-        has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
+def run_skim_cycle(force_manual=False):
+    if not cycle_lock.acquire(blocking=force_manual):
+        return  # Skip if another cycle is already mid-flight
 
+    t0 = time.time()
     try:
-        price, amt_prec, px_prec, min_quote, min_base = fetch_ticker_and_pair_info(pair)
+        with state_lock:
+            pair = STATE["pair"].strip().upper()
+            base_curr = pair.split("_")[0]
+            principal = float(STATE["principal_usdt"])
+            skim_pct = float(STATE["skim_target_pct"])
+            fee_buf = float(STATE["fee_buffer_pct"])
+            pullback_pct = float(STATE.get("rebuy_pullback_pct", 0.0))
+            armed = bool(STATE["armed"])
+            has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
+
+        price, high_24, low_24, chg_24, amt_prec, px_prec, min_quote, min_base = fetch_market_snapshot(pair)
         base_bal, usdt_bal = (0.0, 0.0)
         if has_keys:
             base_bal, usdt_bal = fetch_spot_balances(base_curr)
 
         with state_lock:
+            STATE["cycle_count"] = STATE.get("cycle_count", 0) + 1
             STATE["last_price"] = price
+            STATE["high_24h"] = high_24
+            STATE["low_24h"] = low_24
+            STATE["change_24h_pct"] = chg_24
             STATE["base_balance"] = base_bal
             STATE["usdt_balance"] = usdt_bal
 
             pos_val = base_bal * price
             STATE["position_value_usdt"] = round(pos_val, 4)
 
-            # Determine active phase from live token balance
-            holding_tokens = pos_val >= max(min_quote * 1.1, principal * 0.40)
+            holding_tokens = pos_val >= max(min_quote * 1.05, principal * 0.40)
             if holding_tokens:
                 STATE["phase"] = "HOLDING_FOR_SKIM"
                 if STATE["entry_price"] <= 0:
                     STATE["entry_price"] = price
-                    add_log(f"Existing {base_curr} detected: Locked Entry Floor at ${price:.4f}")
+                    add_log(f"Detected {base_curr} balance: Entry Floor auto-locked @ ${price:.4f}")
             else:
                 STATE["phase"] = "WAITING_TO_BUY"
 
@@ -213,34 +260,33 @@ def run_skim_cycle():
             STATE["last_update"] = datetime.utcnow().strftime("%H:%M:%S")
 
             if not armed:
-                STATE["status_msg"] = f"PAPER STANDBY | {pair} @ ${price:.4f} ({ms}ms)"
+                STATE["status_msg"] = f"PAPER STANDBY | {pair} Live @ ${price:.4f} ({ms}ms)"
                 save_state()
                 return
 
             if not has_keys:
-                STATE["status_msg"] = "ARMED - Paste Gate.io API Keys to Execute"
+                STATE["status_msg"] = "ARMED - Waiting for Gate.io API Key & Secret"
                 save_state()
                 return
 
             # =========================================================================
-            # PHASE A: HOLDING TOKENS -> WAIT FOR +1% ABOVE ENTRY FLOOR, THEN SELL 100%
+            # PHASE A: HOLDING TOKENS -> SELL 100% AT +1% ABOVE ENTRY FLOOR
             # =========================================================================
             if STATE["phase"] == "HOLDING_FOR_SKIM":
                 if price < target_sell_px:
                     if price < entry_px:
                         STATE["status_msg"] = (
-                            f"HOLDING (CAPITAL PROTECTED) | Live ${price:.4f} < Entry Floor ${entry_px:.4f} "
-                            f"(Waiting for ${target_sell_px:.4f})"
+                            f"CAPITAL PROTECTED HOLD | Live ${price:.4f} < Entry Floor ${entry_px:.4f} "
+                            f"(Target ${target_sell_px:.4f})"
                         )
                     else:
                         STATE["status_msg"] = (
-                            f"CLIMBING (+{STATE['unrealized_pnl_pct']:.2f}%) | Entry ${entry_px:.4f} -> "
-                            f"+1% Skim Target ${target_sell_px:.4f}"
+                            f"CLIMBING (+{STATE['unrealized_pnl_pct']:.2f}%) | Entry ${entry_px:.4f} → "
+                            f"+{skim_pct}% Target ${target_sell_px:.4f}"
                         )
                     save_state()
                     return
 
-                # +1% Target Hit! Sell 100% of base_bal to lock in the 1% gain cleanly
                 sell_amt_str = format_dec(base_bal, amt_prec)
                 sell_px_str = format_dec(price * 0.998, px_prec)
                 code, resp = place_gate_order(pair, "sell", sell_amt_str, sell_px_str)
@@ -265,16 +311,16 @@ def run_skim_cycle():
                         "principal_redeployed": f"${principal:.2f}"
                     }
                     STATE["skim_ledger"].insert(0, ledger_entry)
-                    STATE["skim_ledger"] = STATE["skim_ledger"][:35]
+                    STATE["skim_ledger"] = STATE["skim_ledger"][:40]
 
                     add_log(
-                        f"SKIM #{STATE['skim_count']} HIT (+1%): Sold {sell_amt_str} {base_curr} @ ${price:.4f} "
-                        f"| Skimmed +${skimmed_profit:.4f} USDT to Vault!"
+                        f"SKIM #{STATE['skim_count']} WON (+{skim_pct}%): Sold {sell_amt_str} {base_curr} @ ${price:.4f} "
+                        f"| Vaulted +${skimmed_profit:.4f} USDT!"
                     )
 
-                    # Instant Auto-Rebuy with ONLY the Protected Principal if pullback == 0
+                    # Instant Auto-Rebuy of Principal at the new price if pullback == 0
                     if pullback_pct <= 0.0:
-                        time.sleep(0.4)
+                        time.sleep(0.35)
                         rebuy_amt = principal / price
                         rebuy_amt_str = format_dec(rebuy_amt, amt_prec)
                         rebuy_px_str = format_dec(price * 1.002, px_prec)
@@ -286,41 +332,41 @@ def run_skim_cycle():
                             STATE["target_sell_price"] = round(new_target, px_prec)
                             STATE["status_msg"] = (
                                 f"SKIMMED +${skimmed_profit:.4f} & REBOUGHT ${principal:.2f} @ ${price:.4f} "
-                                f"| Next +1% Target: ${new_target:.4f}"
+                                f"→ Next Target ${new_target:.4f}"
                             )
                             add_log(
-                                f"AUTO-REBUY COMPLETE: Deployed ${principal:.2f} Principal @ ${price:.4f}. "
-                                f"New +1% Skim Target locked at ${new_target:.4f}"
+                                f"AUTO-REBUY LOCKED: Redeployed ${principal:.2f} Principal @ ${price:.4f} "
+                                f"| Next +{skim_pct}% Skim @ ${new_target:.4f}"
                             )
                         else:
                             STATE["phase"] = "WAITING_TO_BUY"
-                            add_log(f"Auto-rebuy queued for next tick ({b_code}): {b_resp.get('message', '')}")
+                            add_log(f"Rebuy queued for next cycle ({b_code}): {b_resp.get('message', '')}")
                     else:
                         STATE["phase"] = "WAITING_TO_BUY"
                         STATE["status_msg"] = (
                             f"SKIMMED +${skimmed_profit:.4f}! Waiting for -{pullback_pct}% pullback "
-                            f"to ${rebuy_px:.4f} to rebuy ${principal:.2f}"
+                            f"to ${rebuy_px:.4f}"
                         )
                 else:
-                    add_log(f"Skim sell rejected ({code}): {resp.get('message', resp)}")
+                    add_log(f"Skim sell notice ({code}): {resp.get('message', resp)}")
 
                 save_state()
                 return
 
             # =========================================================================
-            # PHASE B: WAITING TO BUY / AUTO-REBUY ONLY THE PROTECTED PRINCIPAL ($C)
+            # PHASE B: AUTO-BUY / REBUY EXACT PROTECTED PRINCIPAL ($C)
             # =========================================================================
             if STATE["phase"] == "WAITING_TO_BUY":
                 if usdt_bal < principal:
                     STATE["status_msg"] = (
-                        f"AWAITING USDT FOR REBUY: Have ${usdt_bal:.2f} USDT, Need ${principal:.2f} Principal"
+                        f"WAITING FOR USDT: Available ${usdt_bal:.2f} USDT < Protected Principal ${principal:.2f}"
                     )
                     save_state()
                     return
 
                 if pullback_pct > 0 and last_sell_px > 0 and price > rebuy_px:
                     STATE["status_msg"] = (
-                        f"WAITING FOR REBUY PULLBACK | Live ${price:.4f} -> Target Rebuy ${rebuy_px:.4f}"
+                        f"WAITING FOR REBUY PULLBACK | Live ${price:.4f} → Rebuy Trigger ${rebuy_px:.4f}"
                     )
                     save_state()
                     return
@@ -336,42 +382,101 @@ def run_skim_cycle():
                     new_target = price * (1.0 + (effective_gain_pct / 100.0))
                     STATE["target_sell_price"] = round(new_target, px_prec)
                     STATE["status_msg"] = (
-                        f"BOUGHT ${principal:.2f} {base_curr} @ ${price:.4f} | Waiting for +1% (${new_target:.4f})"
+                        f"DEPLOYED ${principal:.2f} IN {base_curr} @ ${price:.4f} → Target ${new_target:.4f}"
                     )
                     add_log(
-                        f"ENTRY LOCKED: Bought {buy_amt_str} {base_curr} (${principal:.2f}) @ ${price:.4f} "
-                        f"| Will skim at ${new_target:.4f} (+{skim_pct}%)"
+                        f"PRINCIPAL DEPLOYED: Bought {buy_amt_str} {base_curr} (${principal:.2f}) @ ${price:.4f} "
+                        f"| Skim Target: ${new_target:.4f} (+{skim_pct}%)"
                     )
                 else:
-                    add_log(f"Entry buy warning ({code}): {resp.get('message', resp)}")
+                    add_log(f"Buy order notice ({code}): {resp.get('message', resp)}")
 
                 save_state()
 
     except Exception as e:
         with state_lock:
-            STATE["status_msg"] = f"Check warning: {str(e)[:65]}"
-            add_log(f"Cycle alert: {str(e)[:90]}")
+            STATE["status_msg"] = f"Syncing Node: {str(e)[:60]}"
+            add_log(f"Network notice: {str(e)[:85]}")
+    finally:
+        cycle_lock.release()
 
 
 def background_worker():
     load_state()
-    add_log("VaultSkimmer v2.0 Online: 100% Sell + Principal Auto-Rebuy Loop Ready.")
+    add_log("VaultSkimmer v3.0 Peak Engine Online: Persistent Session + Auto-Rebuy Active.")
     while True:
-        run_skim_cycle()
-        time.sleep(4)
+        run_skim_cycle(force_manual=False)
+        time.sleep(3.5)
 
 
 threading.Thread(target=background_worker, daemon=True).start()
 
 
+# =========================================================================
+# PWA AUTO-INSTALL ENDPOINTS (Manifest, Service Worker, Native Vector Icon)
+# =========================================================================
+@app.route("/icon.svg")
+def app_icon():
+    svg = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+      <defs>
+        <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#10b981"/>
+          <stop offset="100%" stop-color="#06b6d4"/>
+        </linearGradient>
+      </defs>
+      <rect width="512" height="512" rx="115" fill="#060b16"/>
+      <rect x="28" y="28" width="456" height="456" rx="95" fill="none" stroke="url(#g)" stroke-width="18"/>
+      <path d="M135 165 L256 385 L377 165" fill="none" stroke="url(#g)" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+      <circle cx="256" cy="145" r="28" fill="#34d399"/>
+    </svg>"""
+    return Response(svg, mimetype="image/svg+xml")
+
+
+@app.route("/manifest.json")
+def manifest():
+    return jsonify({
+        "name": "VaultSkimmer v3.0 Peak Engine",
+        "short_name": "VaultSkimmer",
+        "description": "Capital-First +1% Spot Skimmer & Auto-Rebuy Engine",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#060b16",
+        "theme_color": "#10b981",
+        "orientation": "portrait-primary",
+        "icons": [
+            {
+                "src": "/icon.svg",
+                "sizes": "any",
+                "type": "image/svg+xml",
+                "purpose": "any maskable"
+            }
+        ]
+    })
+
+
+@app.route("/sw.js")
+def service_worker():
+    js = """
+    self.addEventListener('install', e => self.skipWaiting());
+    self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+    self.addEventListener('fetch', e => {
+      e.respondWith(fetch(e.request).catch(() => caches.match(e.request)));
+    });
+    """
+    return Response(js, mimetype="application/javascript")
+
+
+# =========================================================================
+# REST API & CRON ENDPOINTS
+# =========================================================================
 @app.route("/ping")
 def ping():
-    return jsonify({"ok": True, "service": "VaultSkimmer-v2", "ts": time.time()})
+    return jsonify({"ok": True, "service": "VaultSkimmer-v3-Peak", "ts": time.time()})
 
 
 @app.route("/api/cron")
 def api_cron():
-    run_skim_cycle()
+    run_skim_cycle(force_manual=False)
     return jsonify({
         "ok": True,
         "armed": STATE["armed"],
@@ -380,8 +485,15 @@ def api_cron():
         "entry_price": STATE["entry_price"],
         "last_price": STATE["last_price"],
         "target_sell_price": STATE["target_sell_price"],
-        "total_skimmed_usdt": STATE["total_skimmed_usdt"]
+        "total_skimmed_usdt": STATE["total_skimmed_usdt"],
+        "scan_ms": STATE["last_scan_ms"]
     })
+
+
+@app.route("/api/scan_now", methods=["POST"])
+def api_scan_now():
+    run_skim_cycle(force_manual=True)
+    return jsonify({"ok": True, "scan_ms": STATE["last_scan_ms"]})
 
 
 @app.route("/api/state")
@@ -403,7 +515,7 @@ def api_config():
                 STATE["pair"] = new_pair
                 STATE["entry_price"] = 0.0
                 STATE["last_skim_sell_price"] = 0.0
-                add_log(f"Switched pair to {new_pair} (Entry floor reset for new asset).")
+                add_log(f"Switched active pair to {new_pair} (Entry floor reset).")
         if "principal_usdt" in data:
             STATE["principal_usdt"] = max(2.0, float(data["principal_usdt"]))
         if "skim_target_pct" in data:
@@ -421,10 +533,10 @@ def api_config():
 
         save_state()
         add_log(
-            f"Synced: {STATE['pair']} | Principal: ${STATE['principal_usdt']:.2f} "
-            f"| Skim: +{STATE['skim_target_pct']}% | Rebuy Pullback: {STATE['rebuy_pullback_pct']}%"
+            f"Synced Settings: {STATE['pair']} | Principal: ${STATE['principal_usdt']:.2f} "
+            f"| Skim: +{STATE['skim_target_pct']}%"
         )
-    run_skim_cycle()
+    run_skim_cycle(force_manual=False)
     return jsonify({"ok": True})
 
 
@@ -433,9 +545,9 @@ def api_toggle_arm():
     with state_lock:
         STATE["armed"] = not STATE["armed"]
         mode = "LIVE ARMED" if STATE["armed"] else "PAPER STANDBY"
-        add_log(f"Engine switched to: {mode}")
+        add_log(f"Engine mode switched to: {mode}")
         save_state()
-    run_skim_cycle()
+    run_skim_cycle(force_manual=False)
     return jsonify({"ok": True, "armed": STATE["armed"]})
 
 
@@ -444,135 +556,212 @@ def api_lock_entry():
     with state_lock:
         if STATE["last_price"] > 0:
             STATE["entry_price"] = STATE["last_price"]
-            add_log(f"Entry Floor locked at live price: ${STATE['entry_price']:.4f}")
+            add_log(f"Entry Floor manually locked @ ${STATE['entry_price']:.4f}")
             save_state()
-    run_skim_cycle()
+    run_skim_cycle(force_manual=False)
     return jsonify({"ok": True, "entry_price": STATE["entry_price"]})
 
 
+# =========================================================================
+# PEAK UPGRADED UI WITH NATIVE 1-CLICK AUTO-INSTALL APP BUTTON
+# =========================================================================
 HTML_UI = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>VaultSkimmer v2.0 | +1% Skim & Auto-Rebuy Engine</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#060b16" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/icon.svg" />
+  <title>VaultSkimmer v3.0 | Peak Capital-First Skim Engine</title>
   <style>
     :root {
-      --bg: #060913;
-      --card: #0d1323;
+      --bg: #050811;
+      --card: rgba(13, 20, 36, 0.88);
       --border: #1e293b;
       --emerald: #10b981;
+      --emerald-glow: rgba(16, 185, 129, 0.28);
       --cyan: #06b6d4;
       --amber: #f59e0b;
+      --purple: #8b5cf6;
       --text: #f8fafc;
       --muted: #94a3b8;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }
-    body { background: radial-gradient(circle at top, #0f172a 0%, #05070f 100%); color: var(--text); padding: 16px; min-height: 100vh; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', -apple-system, system-ui, sans-serif; }
+    body {
+      background: radial-gradient(circle at 50% 0%, #0f1d3a 0%, #050811 70%);
+      color: var(--text); padding: 14px; min-height: 100vh;
+    }
     .wrap { max-width: 1140px; margin: 0 auto; }
-    .hero {
-      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
-      background: linear-gradient(135deg, rgba(16,185,129,0.14), rgba(6,182,212,0.08));
-      border: 1px solid rgba(16,185,129,0.4); border-radius: 16px; padding: 18px 22px; margin-bottom: 16px;
-      box-shadow: 0 12px 32px rgba(0,0,0,0.45);
-    }
-    .hero h1 { font-size: 1.5rem; font-weight: 800; display: flex; align-items: center; gap: 10px; }
-    .tag { background: var(--emerald); color: #022c22; font-size: 0.72rem; font-weight: 900; padding: 3px 9px; border-radius: 99px; }
-    .hero p { color: var(--muted); font-size: 0.83rem; margin-top: 4px; }
-    .pill {
-      display: inline-flex; align-items: center; gap: 8px; padding: 6px 14px; border-radius: 99px;
-      font-weight: 800; font-size: 0.78rem; margin-bottom: 5px;
-    }
-    .pill-live { background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid #10b981; }
-    .pill-paper { background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid #f59e0b; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 1.3s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 
-    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; margin-bottom: 16px; }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px; }
-    .lbl { color: var(--muted); font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; }
-    .val { font-size: 1.5rem; font-weight: 800; margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
-    .sub { font-size: 0.78rem; color: var(--muted); }
+    /* Top Header & Auto-Install Bar */
+    .hero {
+      background: linear-gradient(135deg, rgba(16,185,129,0.14), rgba(6,182,212,0.08));
+      border: 1px solid rgba(16,185,129,0.4); border-radius: 18px; padding: 18px 20px; margin-bottom: 14px;
+      box-shadow: 0 14px 34px rgba(0,0,0,0.5); backdrop-filter: blur(12px);
+    }
+    .hero-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; }
+    .brand-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .brand-title { font-size: 1.55rem; font-weight: 900; letter-spacing: -0.5px; display: flex; align-items: center; gap: 9px; }
+    .v-badge { background: var(--emerald); color: #022c22; font-size: 0.72rem; font-weight: 900; padding: 3px 9px; border-radius: 99px; }
+    .sub-desc { color: var(--muted); font-size: 0.81rem; margin-top: 5px; }
+
+    .top-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .btn-install {
+      background: linear-gradient(135deg, #10b981, #06b6d4); color: #022c22;
+      font-weight: 900; font-size: 0.8rem; padding: 9px 15px; border-radius: 11px; border: none;
+      cursor: pointer; display: inline-flex; align-items: center; gap: 7px;
+      box-shadow: 0 0 18px var(--emerald-glow); transition: transform 0.15s ease;
+    }
+    .btn-install:hover { transform: scale(1.03); }
+    .btn-scan {
+      background: rgba(139, 92, 246, 0.2); border: 1px solid #8b5cf6; color: #ddd6fe;
+      font-weight: 800; font-size: 0.78rem; padding: 8px 13px; border-radius: 10px; cursor: pointer;
+    }
+
+    .telemetry-strip {
+      display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+      margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.08);
+      font-size: 0.79rem; color: var(--muted); gap: 8px;
+    }
+    .pill {
+      display: inline-flex; align-items: center; gap: 7px; padding: 5px 13px; border-radius: 99px;
+      font-weight: 800; font-size: 0.75rem;
+    }
+    .pill-live { background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid #10b981; box-shadow: 0 0 12px var(--emerald-glow); }
+    .pill-paper { background: rgba(245,158,11,0.18); color: #fbbf24; border: 1px solid #f59e0b; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; animation: pulse 1.2s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+    /* KPI Grid */
+    .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 14px; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 15px; padding: 15px 16px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35); backdrop-filter: blur(8px);
+    }
+    .lbl { color: var(--muted); font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.6px; }
+    .val { font-size: 1.48rem; font-weight: 900; margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
+    .sub { font-size: 0.77rem; color: var(--muted); }
     .c-green { color: #34d399; }
     .c-cyan { color: #22d3ee; }
     .c-amber { color: #fbbf24; }
 
-    .bar-card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 15px 18px; margin-bottom: 16px; }
-    .bar-top { display: flex; justify-content: space-between; font-size: 0.83rem; font-weight: 700; margin-bottom: 9px; }
-    .track { height: 12px; background: #050811; border-radius: 99px; overflow: hidden; border: 1px solid #1e293b; }
-    .fill { height: 100%; width: 0%; background: linear-gradient(90deg, #06b6d4, #10b981); transition: width 0.4s ease; }
-
-    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; margin-bottom: 16px; }
-    .sec-title { font-size: 0.88rem; font-weight: 800; text-transform: uppercase; color: #38bdf8; margin-bottom: 14px; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
-    label { display: block; font-size: 0.75rem; color: var(--muted); margin-bottom: 5px; font-weight: 600; }
-    input, select {
-      width: 100%; background: #060913; border: 1px solid #26334d; color: var(--text);
-      padding: 10px 12px; border-radius: 10px; font-size: 0.88rem; font-weight: 600;
+    /* Progress & Live Trajectory */
+    .bar-card { background: var(--card); border: 1px solid var(--border); border-radius: 15px; padding: 15px 18px; margin-bottom: 14px; }
+    .bar-top { display: flex; justify-content: space-between; align-items: center; font-size: 0.82rem; font-weight: 800; margin-bottom: 9px; flex-wrap: wrap; gap: 6px; }
+    .track { height: 13px; background: #04070e; border-radius: 99px; overflow: hidden; border: 1px solid #1e293b; }
+    .fill {
+      height: 100%; width: 0%; background: linear-gradient(90deg, #06b6d4, #10b981);
+      transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 0 14px var(--emerald);
     }
-    .btns { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
-    button { cursor: pointer; border: none; border-radius: 10px; padding: 11px 15px; font-weight: 800; font-size: 0.84rem; }
+
+    /* Controls & Ledger Grid */
+    .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(335px, 1fr)); gap: 14px; margin-bottom: 14px; }
+    .sec-title { font-size: 0.85rem; font-weight: 900; text-transform: uppercase; letter-spacing: 0.5px; color: #38bdf8; margin-bottom: 13px; display: flex; justify-content: space-between; align-items: center; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+    label { display: block; font-size: 0.73rem; color: var(--muted); margin-bottom: 4px; font-weight: 700; }
+    input, select {
+      width: 100%; background: #050811; border: 1px solid #26334d; color: var(--text);
+      padding: 10px 11px; border-radius: 10px; font-size: 0.87rem; font-weight: 700;
+    }
+    input:focus, select:focus { outline: none; border-color: var(--cyan); }
+    .btns { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 12px; }
+    button.ctrl { cursor: pointer; border: none; border-radius: 10px; padding: 11px 14px; font-weight: 800; font-size: 0.83rem; transition: all 0.15s ease; }
     .b-save { background: linear-gradient(135deg, #10b981, #059669); color: #022c22; flex: 1; }
     .b-arm { background: linear-gradient(135deg, #f59e0b, #d97706); color: #1e1b4b; flex: 1; }
-    .b-lock { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
+    .b-lock { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; width: 100%; }
 
-    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
-    th, td { padding: 9px 7px; text-align: left; border-bottom: 1px solid #1e293b; }
-    th { color: var(--muted); font-size: 0.7rem; text-transform: uppercase; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.79rem; }
+    th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid #1e293b; font-variant-numeric: tabular-nums; }
+    th { color: var(--muted); font-size: 0.69rem; text-transform: uppercase; }
     .logs {
-      background: #05070f; border: 1px solid #1e293b; border-radius: 10px; padding: 12px;
-      height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.77rem; color: #cbd5e1; line-height: 1.55;
+      background: #04070e; border: 1px solid #1e293b; border-radius: 11px; padding: 11px;
+      height: 215px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.76rem; color: #cbd5e1; line-height: 1.55;
     }
+
+    /* Install Modal for iOS / Browsers */
+    #installModal {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 999;
+      align-items: center; justify-content: center; padding: 18px;
+    }
+    .modal-box {
+      background: #0f172a; border: 1px solid #10b981; border-radius: 16px; max-width: 400px; width: 100%;
+      padding: 20px; text-align: center; box-shadow: 0 20px 50px rgba(0,0,0,0.7);
+    }
+    .modal-box h3 { font-size: 1.1rem; margin-bottom: 10px; color: #34d399; }
+    .modal-box p { font-size: 0.85rem; color: #cbd5e1; line-height: 1.5; margin-bottom: 16px; }
   </style>
 </head>
 <body>
 <div class="wrap">
   <div class="hero">
-    <div>
-      <h1>VaultSkimmer <span class="tag">v2.0 AUTO-REBUY LOOP</span></h1>
-      <p>Buys with Protected Principal • Sells 100% at +1% Above Entry • Vaults 1% Profit & Immediately Rebuys</p>
+    <div class="hero-top">
+      <div>
+        <div class="brand-row">
+          <div class="brand-title">VaultSkimmer <span class="v-badge">v3.0 PEAK</span></div>
+        </div>
+        <div class="sub-desc">Capital-First +1% Spot Skimmer • 100% Flip & Instant Principal Auto-Rebuy • Persistent Low-Latency Pool</div>
+      </div>
+      <div class="top-actions">
+        <button class="btn-install" id="installBtn" onclick="triggerInstall()">📲 Install App</button>
+        <button class="btn-scan" onclick="manualScan()" id="scanBtn">⚡ Scan Now</button>
+      </div>
     </div>
-    <div style="text-align:right; font-size:0.8rem; color:var(--muted);">
-      <div id="modePill" class="pill pill-paper"><span class="dot"></span> <span id="modeText">PAPER STANDBY</span></div>
-      <div>Cycle: <strong id="lastUpdate">--:--:--</strong> (<span id="scanMs">0</span>ms) | Phase: <strong class="c-cyan" id="phaseText">WAITING</strong></div>
+
+    <div class="telemetry-strip">
+      <div>
+        <span id="modePill" class="pill pill-paper"><span class="dot"></span> <span id="modeText">PAPER STANDBY</span></span>
+        <span style="margin-left:8px;">Phase: <strong class="c-cyan" id="phaseText">WAITING</strong></span>
+      </div>
+      <div>
+        24h Range: <strong id="low24">$0.00</strong> – <strong id="high24">$0.00</strong> (<span id="chg24">0.00%</span>)
+      </div>
+      <div>
+        Last Scan: <strong id="lastUpdate">--:--:--</strong> (<strong class="c-green" id="scanMs">0</strong>ms | Cycle #<span id="cycleNum">0</span>)
+      </div>
     </div>
   </div>
 
   <div class="grid-4">
     <div class="card">
-      <div class="lbl">Protected Principal (Redeployed)</div>
+      <div class="lbl">Protected Principal (Active Base)</div>
       <div class="val c-cyan" id="principalVal">$25.00</div>
-      <div class="sub">Active Position: <strong id="posVal">$0.0000</strong> (<span id="baseBal">0.00</span>)</div>
+      <div class="sub">Live Token Value: <strong id="posVal">$0.0000</strong> (<span id="baseBal">0.00</span>)</div>
     </div>
     <div class="card">
-      <div class="lbl">Current Entry → +1% Sell Trigger</div>
+      <div class="lbl">Entry Floor → +1% Skim Target</div>
       <div class="val" id="entryToTarget">$0.00 → $0.00</div>
       <div class="sub">Live Price: <strong class="c-amber" id="livePrice">$0.0000</strong> (<span id="pnlPct">0.00%</span>)</div>
     </div>
     <div class="card">
-      <div class="lbl">Expected Skim on Current Wave</div>
+      <div class="lbl">Next +1% Skim Payout</div>
       <div class="val c-amber" id="expectedSkim">+$0.2500</div>
       <div class="sub">Rebuy Mode: <strong id="rebuyMode">Instant @ New Price</strong></div>
     </div>
     <div class="card">
       <div class="lbl">Realized USDT Profit Vault</div>
       <div class="val c-green" id="totalSkimmed">+$0.0000</div>
-      <div class="sub">1% Flips Won: <strong id="skimCount">0</strong> | Free USDT: <strong id="usdtBal">$0.00</strong></div>
+      <div class="sub">1% Skims Won: <strong id="skimCount">0</strong> | Free USDT: <strong id="usdtBal">$0.00</strong></div>
     </div>
   </div>
 
   <div class="bar-card">
     <div class="bar-top">
-      <span id="statusBanner">Syncing with Gate.io Spot Engine...</span>
-      <span id="progressLabel">0% to +1% Skim</span>
+      <span id="statusBanner">Connecting to Persistent Gate.io Spot Engine...</span>
+      <span id="progressLabel" class="c-green">0.0% to +1% Skim</span>
     </div>
     <div class="track"><div class="fill" id="progressBar"></div></div>
   </div>
 
   <div class="grid-2">
     <div class="card">
-      <div class="sec-title">⚙️ Principal, +1% Skim & Auto-Rebuy Settings</div>
+      <div class="sec-title">
+        <span>⚙️ Capital-First & Auto-Rebuy Controls</span>
+      </div>
       <div class="row">
         <div>
           <label>Spot Pair (Gate.io)</label>
@@ -595,14 +784,14 @@ HTML_UI = """
           <input type="number" id="skimPctInput" step="0.1" value="1.0" />
         </div>
         <div>
-          <label>Rebuy Pullback % (0 = Instant Rebuy)</label>
+          <label>Rebuy Pullback % (0 = Instant)</label>
           <input type="number" id="pullbackInput" step="0.05" value="0.0" />
         </div>
       </div>
       <div class="row">
         <div>
-          <label>Current Entry Floor ($)</label>
-          <input type="number" id="entryInput" step="0.0001" placeholder="Auto-updates on every buy" />
+          <label>Locked Entry Floor ($)</label>
+          <input type="number" id="entryInput" step="0.0001" placeholder="Auto-locks on buy" />
         </div>
         <div>
           <label>Gate.io v4 API Key</label>
@@ -616,27 +805,29 @@ HTML_UI = """
         </div>
       </div>
       <div class="btns">
-        <button class="b-save" onclick="saveSettings()">💾 Save & Sync Loop</button>
-        <button class="b-arm" onclick="toggleArm()">⚡ Arm / Disarm Live Bot</button>
-        <button class="b-lock" onclick="lockCurrentEntry()">🔒 Set Live Price as Entry</button>
+        <button class="ctrl b-save" onclick="saveSettings()" id="saveBtn">💾 Save & Sync</button>
+        <button class="ctrl b-arm" onclick="toggleArm()" id="armBtn">⚡ Arm / Disarm Bot</button>
+        <button class="ctrl b-lock" onclick="lockCurrentEntry()">🔒 Lock Current Price as Entry Floor</button>
       </div>
     </div>
 
     <div class="card">
-      <div class="sec-title">💎 Completed +1% Skim & Rebuy Ledger</div>
-      <div style="max-height: 290px; overflow-y: auto;">
+      <div class="sec-title">
+        <span>💎 Verified +1% Skim & Rebuy Ledger</span>
+      </div>
+      <div style="max-height: 295px; overflow-y: auto;">
         <table>
           <thead>
             <tr>
               <th>Time</th>
               <th>Flip</th>
               <th>Buy → +1% Sell</th>
-              <th>Vaulted Profit</th>
+              <th>Profit</th>
               <th>Rebought</th>
             </tr>
           </thead>
           <tbody id="ledgerBody">
-            <tr><td colspan="5" style="color:#64748b; text-align:center; padding:20px;">No flips yet — waiting for +1% move above Entry Floor.</td></tr>
+            <tr><td colspan="5" style="color:#64748b; text-align:center; padding:22px;">No flips logged yet — waiting for +1% move above Entry Floor.</td></tr>
           </tbody>
         </table>
       </div>
@@ -644,13 +835,67 @@ HTML_UI = """
   </div>
 
   <div class="card">
-    <div class="sec-title">📡 Live Auto-Rebuy & Skim Telemetry</div>
+    <div class="sec-title"><span>📡 High-Speed Engine Telemetry Logs</span></div>
     <div class="logs" id="logBox"></div>
+  </div>
+</div>
+
+<!-- Fallback Install Guide Modal -->
+<div id="installModal" onclick="this.style.display='none'">
+  <div class="modal-box" onclick="event.stopPropagation()">
+    <h3>📲 Install VaultSkimmer App</h3>
+    <p id="installModalText">
+      To install VaultSkimmer as a fullscreen native app:<br/><br/>
+      <strong>Android / Chrome:</strong> Tap the browser menu (⋮) and select <strong>"Install app"</strong> or <strong>"Add to Home screen"</strong>.<br/><br/>
+      <strong>iPhone / Safari:</strong> Tap the <strong>Share</strong> button at the bottom and tap <strong>"Add to Home Screen"</strong>.
+    </p>
+    <button class="btn-install" style="width:100%; justify-content:center;" onclick="document.getElementById('installModal').style.display='none'">Got It</button>
   </div>
 </div>
 
 <script>
   let initialized = false;
+  let deferredPrompt = null;
+
+  // Register Service Worker for Native App Installation
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    });
+  }
+
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+    const btn = document.getElementById('installBtn');
+    btn.innerHTML = '📲 Auto-Install App';
+  });
+
+  window.addEventListener('appinstalled', () => {
+    deferredPrompt = null;
+    document.getElementById('installBtn').innerHTML = '✅ App Installed';
+  });
+
+  async function triggerInstall() {
+    if (deferredPrompt) {
+      deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      if (outcome === 'accepted') {
+        document.getElementById('installBtn').innerHTML = '✅ Installed';
+      }
+      deferredPrompt = null;
+    } else {
+      document.getElementById('installModal').style.display = 'flex';
+    }
+  }
+
+  async function manualScan() {
+    const btn = document.getElementById('scanBtn');
+    btn.innerText = 'Scanning...';
+    await fetch('/api/scan_now', { method: 'POST' });
+    await refresh();
+    btn.innerText = '⚡ Scan Now';
+  }
 
   async function refresh() {
     try {
@@ -659,7 +904,12 @@ HTML_UI = """
 
       document.getElementById('lastUpdate').innerText = s.last_update;
       document.getElementById('scanMs').innerText = s.last_scan_ms;
+      document.getElementById('cycleNum').innerText = s.cycle_count || 0;
       document.getElementById('phaseText').innerText = s.phase;
+      document.getElementById('low24').innerText = '$' + Number(s.low_24h || 0).toFixed(4);
+      document.getElementById('high24').innerText = '$' + Number(s.high_24h || 0).toFixed(4);
+      const chg = Number(s.change_24h_pct || 0);
+      document.getElementById('chg24').innerText = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
 
       const pill = document.getElementById('modePill');
       const modeText = document.getElementById('modeText');
@@ -692,7 +942,7 @@ HTML_UI = """
       const needPct = Number(s.skim_target_pct) + Number(s.fee_buffer_pct);
       const pct = Math.max(0, Math.min(100, (s.unrealized_pnl_pct / needPct) * 100));
       document.getElementById('progressBar').style.width = pct.toFixed(1) + '%';
-      document.getElementById('progressLabel').innerText = pct.toFixed(1) + '% to +1% Skim';
+      document.getElementById('progressLabel').innerText = pct.toFixed(1) + '% to +' + s.skim_target_pct + '% Skim';
 
       if (!initialized) {
         document.getElementById('pairInput').value = s.pair;
@@ -721,6 +971,8 @@ HTML_UI = """
   }
 
   async function saveSettings() {
+    const btn = document.getElementById('saveBtn');
+    btn.innerText = 'Saving...';
     const payload = {
       pair: document.getElementById('pairInput').value,
       principal_usdt: parseFloat(document.getElementById('principalInput').value),
@@ -735,7 +987,9 @@ HTML_UI = """
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
     });
-    refresh();
+    await refresh();
+    btn.innerText = '✅ Saved!';
+    setTimeout(() => { btn.innerText = '💾 Save & Sync'; }, 1200);
   }
 
   async function toggleArm() {
@@ -746,13 +1000,13 @@ HTML_UI = """
   async function lockCurrentEntry() {
     const r = await fetch('/api/lock_current_entry', { method: 'POST' });
     const d = await r.json();
-    if (d.entry_price) document.getElementById('entryInput').value = d.entry_price; 
+    if (d.entry_price) document.getElementById('entryInput').value = d.entry_price;
     refresh();
   }
 
-  setInterval(refresh, 3000);  
+  setInterval(refresh, 2500);
   refresh();
-</script> 
+</script>
 </body>
 </html>
 """
