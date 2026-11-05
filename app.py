@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "vaultskimmer_v5_6_state.json"
+STATE_FILE = "vaultskimmer_v5_7_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -39,7 +39,7 @@ def fmt_px(val):
     return f"${v:.4f}"
 
 
-def make_slot(pair, principal, skim_pct, stop_reset_pct=3.0, pullback_pct=0.30, entry_price=0.0):
+def make_slot(pair, principal, skim_pct, stop_reset_pct=3.0, pullback_pct=0.0, entry_price=0.0):
     return {
         "pair": pair,
         "principal_usdt": float(principal),
@@ -72,7 +72,7 @@ def make_slot(pair, principal, skim_pct, stop_reset_pct=3.0, pullback_pct=0.30, 
 
 DEFAULT_STATE = {
     "mode": "PAPER",
-    "fee_buffer_pct": 0.25,
+    "fee_buffer_pct": 0.40,
     "api_key": os.environ.get("GATE_API_KEY", "").strip(),
     "api_secret": os.environ.get("GATE_API_SECRET", "").strip(),
     "api_connected": False,
@@ -111,7 +111,7 @@ def normalize_pair(raw_pair):
 
 def load_state():
     global STATE
-    for fn in [STATE_FILE, "vaultskimmer_v5_5_state.json", "vaultskimmer_v5_4_state.json"]:
+    for fn in [STATE_FILE, "vaultskimmer_v5_6_state.json", "vaultskimmer_v5_5_state.json", "vaultskimmer_v5_4_state.json"]:
         if os.path.exists(fn):
             try:
                 with open(fn, "r") as f:
@@ -123,11 +123,24 @@ def load_state():
                         STATE["api_key"] = saved_key
                     if saved_sec:
                         STATE["api_secret"] = saved_sec
+                    if float(STATE.get("fee_buffer_pct", 0.0)) < 0.40:
+                        STATE["fee_buffer_pct"] = 0.40
                     if "slots" not in STATE or not isinstance(STATE["slots"], dict):
                         STATE["slots"] = {}
+                    for sl in STATE["slots"].values():
+                        if "actual_cost_usdt" not in sl:
+                            sl["actual_cost_usdt"] = 0.0
                 break
             except Exception as e:
                 add_log(f"State load notice: {e}")
+
+    # Always prefer Render Environment Variables if set
+    env_k = os.environ.get("GATE_API_KEY", "").strip()
+    env_s = os.environ.get("GATE_API_SECRET", "").strip()
+    if env_k:
+        STATE["api_key"] = env_k
+    if env_s:
+        STATE["api_secret"] = env_s
 
 
 def save_state():
@@ -230,14 +243,43 @@ def format_dec(val, precision, round_mode=ROUND_DOWN):
     return str(Decimal(str(val)).quantize(q, rounding=round_mode))
 
 
-def calc_fee_protected_buy_amt(budget_usdt, price, amt_prec):
-    raw_units = budget_usdt / price
+def calc_strict_buy_amt(max_budget_usdt, price, amt_prec):
+    """
+    Calculates the exact buy quantity so that total USDT spent (including limit buffer)
+    NEVER exceeds `max_budget_usdt`. This guarantees that skimmed profit stays in USDT!
+    """
+    safe_usdt = max_budget_usdt * 0.998
+    raw_units = safe_usdt / price
     if amt_prec == 0:
         target_int = int(Decimal(str(raw_units)).quantize(Decimal("1"), rounding=ROUND_DOWN))
         return str(max(1, target_int))
+    return format_dec(raw_units, amt_prec, ROUND_DOWN)
+
+
+def parse_gate_fill(resp, fallback_qty, fallback_px, side="buy"):
+    """
+    Extracts exact USDT spent/received and fill price from Gate.io order response.
+    """
+    filled_total = float(resp.get("filled_total") or 0.0) if isinstance(resp, dict) else 0.0
+    filled_amt = float(resp.get("filled_amount") or 0.0) if isinstance(resp, dict) else 0.0
+    fill_px = float(resp.get("fill_price") or 0.0) if isinstance(resp, dict) else 0.0
+    fee_val = float(resp.get("fee") or 0.0) if isinstance(resp, dict) else 0.0
+    fee_curr = (resp.get("fee_currency") or "") if isinstance(resp, dict) else ""
+
+    qty = filled_amt if filled_amt > 0 else float(fallback_qty)
+    gross_usdt = filled_total if filled_total > 0 else (qty * fallback_px)
+    if fill_px <= 0:
+        fill_px = (gross_usdt / qty) if qty > 0 else fallback_px
+
+    if side == "sell":
+        usdt_fee = fee_val if (fee_curr == "USDT" and fee_val > 0) else (gross_usdt * 0.002)
+        net_usdt = gross_usdt - usdt_fee
+        return net_usdt, fill_px, qty
     else:
-        padded = raw_units * 1.0012
-        return format_dec(padded, amt_prec, ROUND_DOWN)
+        # For buy orders, if fee was deducted in base token (e.g. ADA), reduce net received units
+        net_units = (qty - fee_val) if (fee_curr != "USDT" and fee_curr != "" and fee_val > 0) else (qty * 0.998)
+        usdt_spent = gross_usdt + (fee_val if fee_curr == "USDT" else 0.0)
+        return usdt_spent, fill_px, net_units
 
 
 def place_gate_order(pair, side, amount_str, price_str):
@@ -262,7 +304,7 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
     principal = float(slot["principal_usdt"])
     skim_pct = float(slot["skim_target_pct"])
     stop_reset_pct = float(slot.get("stop_reset_pct", 3.0))
-    pullback_pct = float(slot.get("rebuy_pullback_pct", 0.30))
+    pullback_pct = float(slot.get("rebuy_pullback_pct", 0.0))
 
     tk = ticker_map.get(pair)
     if not tk:
@@ -292,7 +334,7 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
         slot["entry_price"] = 0.0
 
     now = time.time()
-    in_cooldown = (now - float(slot.get("last_trade_ts", 0.0))) < 12.0
+    in_cooldown = (now - float(slot.get("last_trade_ts", 0.0))) < 8.0
 
     # =========================================================================
     # PAPER SIMULATION MODE
@@ -315,33 +357,39 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
                     )
                     return
 
-            sim_tokens = principal / price
+            sim_tokens = float(calc_strict_buy_amt(principal, price, amt_prec))
+            actual_cost = round(sim_tokens * price, 4)
             slot["paper_base_bal"] = sim_tokens
             slot["base_balance"] = sim_tokens
-            slot["position_value_usdt"] = round(principal, 4)
+            slot["actual_cost_usdt"] = actual_cost
+            slot["position_value_usdt"] = actual_cost
             slot["entry_price"] = price
             target_px = price * (1.0 + (effective_gain_pct / 100.0))
             stop_px = price * (1.0 - (stop_reset_pct / 100.0))
             slot["target_sell_price"] = round(target_px, px_prec)
             slot["stop_reset_price"] = round(stop_px, px_prec)
             slot["phase"] = "HOLDING_FOR_SKIM"
-            slot["status_msg"] = f"[PAPER] Bought ${principal:.2f} @ {fmt_px(price)} → Target {fmt_px(target_px)}"
+            slot["status_msg"] = f"[PAPER] Bought ${actual_cost:.2f} @ {fmt_px(price)} → Target {fmt_px(target_px)}"
             return
 
         slot["phase"] = "HOLDING_FOR_SKIM"
         slot["base_balance"] = paper_tokens
         slot["position_value_usdt"] = round(pos_val, 4)
         entry_px = slot["entry_price"] if slot["entry_price"] > 0 else price
+        actual_cost = float(slot.get("actual_cost_usdt") or (paper_tokens * entry_px))
+        slot["actual_cost_usdt"] = round(actual_cost, 4)
+
         target_px = entry_px * (1.0 + (effective_gain_pct / 100.0))
         stop_px = entry_px * (1.0 - (stop_reset_pct / 100.0))
         slot["target_sell_price"] = round(target_px, px_prec)
         slot["stop_reset_price"] = round(stop_px, px_prec)
-        slot["unrealized_pnl_usdt"] = round(pos_val - principal, 4)
+        slot["unrealized_pnl_usdt"] = round(pos_val - actual_cost, 4)
         slot["unrealized_pnl_pct"] = round(((price - entry_px) / entry_px) * 100.0, 3)
 
         if price >= target_px:
-            pct_gain = (price - entry_px) / entry_px
-            sim_profit = max(0.01, round(principal * pct_gain - principal * (fee_buf / 100.0), 4))
+            gross_val = paper_tokens * price
+            net_val = gross_val * (1.0 - (fee_buf / 100.0))
+            sim_profit = max(0.01, round(net_val - actual_cost, 4))
             slot["slot_skimmed_usdt"] = round(slot.get("slot_skimmed_usdt", 0.0) + sim_profit, 4)
             slot["slot_skim_count"] = slot.get("slot_skim_count", 0) + 1
             STATE["paper_skimmed_usdt"] = round(STATE.get("paper_skimmed_usdt", 0.0) + sim_profit, 4)
@@ -353,14 +401,17 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
                 slot["base_balance"] = 0.0
                 slot["phase"] = "WAITING_TO_BUY"
             else:
-                slot["paper_base_bal"] = principal / price
+                rebuy_budget = min(principal, net_val - sim_profit)
+                new_tokens = float(calc_strict_buy_amt(rebuy_budget, price, amt_prec))
+                slot["paper_base_bal"] = new_tokens
+                slot["actual_cost_usdt"] = round(new_tokens * price, 4)
                 slot["entry_price"] = price
         else:
             slot["status_msg"] = f"[PAPER] {slot['unrealized_pnl_pct']:+.2f}% | Target {fmt_px(target_px)}"
         return
 
     # =========================================================================
-    # LIVE GATE.IO CASH MODE (TRUE CASH + DIP-OR-BREAKOUT REBUY)
+    # LIVE GATE.IO CASH MODE (STRICT CASH-ISOLATION & INSTANT REBUY CAP)
     # =========================================================================
     if not has_keys:
         slot["status_msg"] = "[LIVE] Connect Gate.io API Keys above first"
@@ -376,24 +427,27 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
     pos_val = real_base_bal * price
     slot["position_value_usdt"] = round(pos_val, 4)
 
-    holding_tokens = sellable_val_usdt >= max(min_quote * 1.05, principal * 0.65)
+    holding_tokens = sellable_val_usdt >= max(min_quote * 1.05, principal * 0.60) and sellable_units > 0
     if holding_tokens:
         slot["phase"] = "HOLDING_FOR_SKIM"
         if slot["entry_price"] <= 0:
             slot["entry_price"] = price
-        if slot.get("actual_cost_usdt", 0.0) <= 0:
-            slot["actual_cost_usdt"] = round(sellable_units * slot["entry_price"], 4)
+        if float(slot.get("actual_cost_usdt") or 0.0) <= 0:
+            # Lock true cost of the sellable coins (including 0.20% entry fee)
+            slot["actual_cost_usdt"] = round((sellable_units * slot["entry_price"]) * 1.002, 4)
     else:
         if not in_cooldown:
             slot["phase"] = "WAITING_TO_BUY"
 
     entry_px = slot["entry_price"] if slot["entry_price"] > 0 else price
-    actual_cost = float(slot.get("actual_cost_usdt") or (sellable_units * entry_px))
+    actual_cost = float(slot.get("actual_cost_usdt") or ((sellable_units * entry_px) * 1.002))
 
-    # Guarantee that selling `sellable_units` yields at least `actual_cost * (1 + skim% + fee%)` in real USDT
-    required_net_usdt = actual_cost * (1.0 + (effective_gain_pct / 100.0))
+    # Target net USDT required after Gate.io's 0.20% sell fee to guarantee `skim_pct` net cash profit above `actual_cost`
+    target_net_usdt = actual_cost * (1.0 + (skim_pct / 100.0))
+    required_gross_usdt = target_net_usdt / 0.998  # accounts for 0.20% sell fee
+
     if sellable_units > 0:
-        min_profitable_px = required_net_usdt / sellable_units
+        min_profitable_px = required_gross_usdt / sellable_units
         target_sell_px = max(entry_px * (1.0 + (effective_gain_pct / 100.0)), min_profitable_px)
     else:
         target_sell_px = entry_px * (1.0 + (effective_gain_pct / 100.0))
@@ -403,7 +457,8 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
     slot["stop_reset_price"] = round(stop_reset_px, px_prec)
 
     if holding_tokens and entry_px > 0:
-        slot["unrealized_pnl_usdt"] = round(sellable_val_usdt - actual_cost, 4)
+        est_net_now = sellable_val_usdt * 0.998
+        slot["unrealized_pnl_usdt"] = round(est_net_now - actual_cost, 4)
         slot["unrealized_pnl_pct"] = round(((price - entry_px) / entry_px) * 100.0, 3)
     else:
         slot["unrealized_pnl_usdt"] = 0.0
@@ -421,29 +476,31 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
             if code in (200, 201):
                 old_ep = entry_px
                 slot["last_trade_ts"] = time.time()
-                time.sleep(0.45)
-                rebuy_budget = min(principal, max(sellable_val_usdt * 0.996, min_quote * 1.05))
-                rebuy_amt_str = calc_fee_protected_buy_amt(rebuy_budget, price, amt_prec)
+                net_usdt_received, _, _ = parse_gate_fill(resp, sellable_units, price, side="sell")
+                time.sleep(0.4)
+                rebuy_budget = min(principal, max(net_usdt_received * 0.996, min_quote * 1.05))
+                rebuy_amt_str = calc_strict_buy_amt(rebuy_budget, price, amt_prec)
                 rebuy_px_str = format_dec(price * 1.003, px_prec)
                 b_code, b_resp = place_gate_order(pair, "buy", rebuy_amt_str, rebuy_px_str)
-                filled_usdt = float(b_resp.get("filled_total", rebuy_budget)) if isinstance(b_resp, dict) else rebuy_budget
-                slot["entry_price"] = price
-                slot["actual_cost_usdt"] = filled_usdt if filled_usdt > 0 else rebuy_budget
-                new_target = price * (1.0 + (effective_gain_pct / 100.0))
-                slot["target_sell_price"] = round(new_target, px_prec)
-                slot["stop_reset_price"] = round(price * (1.0 - (stop_reset_pct / 100.0)), px_prec)
-                slot["status_msg"] = f"[LIVE -{stop_reset_pct}% RESET] Rebought @ {fmt_px(price)} → Target {fmt_px(new_target)}"
-                add_log(
-                    f"🔄 [LIVE -{stop_reset_pct}% RESET][{pair}] Dropped {fmt_px(old_ep)} → {fmt_px(price)}. "
-                    f"Sold & Rebought @ {fmt_px(price)}"
-                )
+                if b_code in (200, 201):
+                    spent_usdt, fill_px, _ = parse_gate_fill(b_resp, rebuy_amt_str, price, side="buy")
+                    slot["entry_price"] = fill_px
+                    slot["actual_cost_usdt"] = round(spent_usdt, 4)
+                    new_target = fill_px * (1.0 + (effective_gain_pct / 100.0))
+                    slot["target_sell_price"] = round(new_target, px_prec)
+                    slot["stop_reset_price"] = round(fill_px * (1.0 - (stop_reset_pct / 100.0)), px_prec)
+                    slot["status_msg"] = f"[LIVE -{stop_reset_pct}% RESET] Rebought (${spent_usdt:.2f}) @ {fmt_px(fill_px)}"
+                    add_log(
+                        f"🔄 [LIVE -{stop_reset_pct}% RESET][{pair}] Dropped {fmt_px(old_ep)} → {fmt_px(fill_px)}. "
+                        f"Sold & Rebought (${spent_usdt:.2f}) @ {fmt_px(fill_px)}"
+                    )
             return
 
-        # 2) HOLD UNTIL SELLABLE UNITS CLEAR TRUE +1% CASH TARGET
-        if price < target_sell_px or sellable_val_usdt < required_net_usdt:
+        # 2) HOLD UNTIL SELLABLE UNITS CLEAR TRUE +1% NET CASH TARGET
+        if price < target_sell_px or sellable_val_usdt < required_gross_usdt:
             slot["status_msg"] = (
                 f"[LIVE] {slot['unrealized_pnl_pct']:+.2f}% (Sellable: ${sellable_val_usdt:.2f} / "
-                f"Target: ${required_net_usdt:.2f} @ {fmt_px(target_sell_px)})"
+                f"Target: ${required_gross_usdt:.2f} @ {fmt_px(target_sell_px)})"
             )
             return
 
@@ -453,10 +510,9 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
 
         if code in (200, 201):
             slot["last_trade_ts"] = time.time()
-            gross_usdt_received = float(resp.get("filled_total") or (sellable_units * price))
-            fee_deducted = float(resp.get("fee") or (gross_usdt_received * 0.001))
-            net_usdt_received = gross_usdt_received - fee_deducted
+            net_usdt_received, fill_sell_px, _ = parse_gate_fill(resp, sellable_units, price, side="sell")
 
+            # Exact net USDT profit left over after recovering `actual_cost`
             true_cash_profit = max(0.01, round(net_usdt_received - actual_cost, 4))
 
             slot["slot_skimmed_usdt"] = round(slot.get("slot_skimmed_usdt", 0.0) + true_cash_profit, 4)
@@ -464,38 +520,48 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
             STATE["live_skimmed_usdt"] = round(STATE.get("live_skimmed_usdt", 0.0) + true_cash_profit, 4)
             STATE["live_skim_count"] = STATE.get("live_skim_count", 0) + 1
             old_entry = entry_px
-            slot["last_skim_sell_price"] = price
+            slot["last_skim_sell_price"] = fill_sell_px
+
+            # STRICT CASH ISOLATION: Never spend more than `net_usdt_received - true_cash_profit` on the rebuy!
+            strict_rebuy_cap = min(principal, max(min_quote * 1.02, net_usdt_received - true_cash_profit))
 
             STATE["skim_ledger"].insert(0, {
                 "time": datetime.utcnow().strftime("%H:%M:%S"),
                 "pair": f"{pair} (LIVE)",
                 "cycle": f"#{STATE['live_skim_count']}",
                 "buy_px": f"{fmt_px(old_entry)} (${actual_cost:.2f})",
-                "sell_px": f"{fmt_px(price)} (${net_usdt_received:.2f})",
+                "sell_px": f"{fmt_px(fill_sell_px)} (${net_usdt_received:.2f})",
                 "profit": f"+${true_cash_profit:.4f}",
-                "principal_redeployed": f"${actual_cost:.2f}"
+                "principal_redeployed": f"${strict_rebuy_cap:.2f}"
             })
             STATE["skim_ledger"] = STATE["skim_ledger"][:50]
 
             add_log(
-                f"💎 [LIVE SKIM][{pair}] Sold {sellable_amt_str} {base_curr} for ${net_usdt_received:.2f} USDT "
-                f"(Cost: ${actual_cost:.2f}) | Real Cash Added: +${true_cash_profit:.4f} USDT!"
+                f"💎 [LIVE SKIM][{pair}] Sold {sellable_amt_str} {base_curr} for ${net_usdt_received:.2f} Net USDT "
+                f"(Cost: ${actual_cost:.2f}) | Cash Locked in Wallet: +${true_cash_profit:.4f} USDT!"
             )
 
             if pullback_pct <= 0.0:
-                time.sleep(0.45)
-                rebuy_budget = min(principal, net_usdt_received - true_cash_profit)
-                rebuy_amt_str = calc_fee_protected_buy_amt(rebuy_budget, price, amt_prec)
+                time.sleep(0.4)
+                rebuy_amt_str = calc_strict_buy_amt(strict_rebuy_cap, price, amt_prec)
                 rebuy_px_str = format_dec(price * 1.002, px_prec)
                 b_code, b_resp = place_gate_order(pair, "buy", rebuy_amt_str, rebuy_px_str)
                 if b_code in (200, 201):
-                    spent_usdt = float(b_resp.get("filled_total") or (float(rebuy_amt_str) * price))
-                    slot["entry_price"] = price
+                    spent_usdt, fill_buy_px, _ = parse_gate_fill(b_resp, rebuy_amt_str, price, side="buy")
+                    slot["entry_price"] = fill_buy_px
                     slot["actual_cost_usdt"] = round(spent_usdt, 4)
                     slot["phase"] = "HOLDING_FOR_SKIM"
-                    new_target = price * (1.0 + (effective_gain_pct / 100.0))
+                    new_target = fill_buy_px * (1.0 + (effective_gain_pct / 100.0))
                     slot["target_sell_price"] = round(new_target, px_prec)
-                    slot["status_msg"] = f"[LIVE] Cash Skimmed +${true_cash_profit:.4f} & Rebought (${spent_usdt:.2f}) @ {fmt_px(price)}"
+                    slot["stop_reset_price"] = round(fill_buy_px * (1.0 - (stop_reset_pct / 100.0)), px_prec)
+                    slot["status_msg"] = (
+                        f"[LIVE] Vaulted +${true_cash_profit:.4f} & Instant-Rebought "
+                        f"{rebuy_amt_str} {base_curr} (${spent_usdt:.2f}) @ {fmt_px(fill_buy_px)}"
+                    )
+                    add_log(
+                        f"[LIVE REBUY][{pair}] Instant-Rebought {rebuy_amt_str} {base_curr} "
+                        f"(Spent: ${spent_usdt:.2f} / Kept +${net_usdt_received - spent_usdt:.4f} in USDT) @ {fmt_px(fill_buy_px)}"
+                    )
                 else:
                     slot["phase"] = "WAITING_TO_BUY"
             else:
@@ -511,7 +577,7 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
         return
 
     # =========================================================================
-    # SMART 3-WAY REBUY: Dip (-0.30%) OR Breakout (+0.50%) OR 180s Timeout
+    # INITIAL BUY / REBUY EXECUTION
     # =========================================================================
     if slot["phase"] == "WAITING_TO_BUY":
         if pullback_pct > 0 and last_sell_px > 0:
@@ -524,27 +590,27 @@ def process_single_slot(pair, slot, mode, fee_buf, has_keys, bal_map, ticker_map
                 )
                 return
 
-        if real_usdt_bal < (principal * 0.95):
+        if real_usdt_bal < min(principal * 0.90, min_quote * 1.05):
             slot["status_msg"] = f"[LIVE] Awaiting USDT (Wallet: ${real_usdt_bal:.2f} / Need: ${principal:.2f})"
             return
 
         buy_budget = min(principal, real_usdt_bal * 0.995)
-        buy_amt_str = calc_fee_protected_buy_amt(buy_budget, price, amt_prec)
+        buy_amt_str = calc_strict_buy_amt(buy_budget, price, amt_prec)
         buy_px_str = format_dec(price * 1.002, px_prec)
         code, resp = place_gate_order(pair, "buy", buy_amt_str, buy_px_str)
 
         if code in (200, 201):
             slot["last_trade_ts"] = time.time()
-            spent_usdt = float(resp.get("filled_total") or (float(buy_amt_str) * price))
-            slot["entry_price"] = price
+            spent_usdt, fill_buy_px, _ = parse_gate_fill(resp, buy_amt_str, price, side="buy")
+            slot["entry_price"] = fill_buy_px
             slot["actual_cost_usdt"] = round(spent_usdt, 4)
             slot["phase"] = "HOLDING_FOR_SKIM"
-            new_target = price * (1.0 + (effective_gain_pct / 100.0))
+            new_target = fill_buy_px * (1.0 + (effective_gain_pct / 100.0))
             slot["target_sell_price"] = round(new_target, px_prec)
-            slot["stop_reset_price"] = round(price * (1.0 - (stop_reset_pct / 100.0)), px_prec)
-            slot["status_msg"] = f"[LIVE] Bought {buy_amt_str} {base_curr} (${spent_usdt:.2f}) @ {fmt_px(price)}"
+            slot["stop_reset_price"] = round(fill_buy_px * (1.0 - (stop_reset_pct / 100.0)), px_prec)
+            slot["status_msg"] = f"[LIVE] Bought {buy_amt_str} {base_curr} (${spent_usdt:.2f}) @ {fmt_px(fill_buy_px)}"
             bal_map["USDT"] = max(0.0, real_usdt_bal - spent_usdt)
-            add_log(f"[LIVE BUY][{pair}] Bought {buy_amt_str} {base_curr} (Actual Cost: ${spent_usdt:.2f}) @ {fmt_px(price)}")
+            add_log(f"[LIVE BUY][{pair}] Bought {buy_amt_str} {base_curr} (Actual Cost: ${spent_usdt:.2f}) @ {fmt_px(fill_buy_px)}")
         else:
             add_log(f"[LIVE][{pair}] Buy rejected ({code}): {resp.get('message', resp)}")
 
@@ -557,7 +623,7 @@ def run_fleet_cycle(force_manual=False):
     try:
         with state_lock:
             mode = STATE.get("mode", "PAPER")
-            fee_buf = float(STATE.get("fee_buffer_pct", 0.25))
+            fee_buf = float(STATE.get("fee_buffer_pct", 0.40))
             has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
             slot_keys = list(STATE["slots"].keys())
 
@@ -613,7 +679,7 @@ def run_fleet_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("VaultSkimmer v5.6 Dip-or-Breakout Engine Online (Anti-Dust + Smart Rebuy Active).")
+    add_log("VaultSkimmer v5.7 Cash-Isolation Engine Online (Instant Rebuy + Strict Profit Lock Active).")
     while True:
         run_fleet_cycle(force_manual=False)
         time.sleep(3.5)
@@ -653,9 +719,9 @@ def app_icon():
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
-        "name": "VaultSkimmer v5.6 Smart-Rebuy",
+        "name": "VaultSkimmer v5.7 Cash-Lock",
         "short_name": "VaultSkimmer",
-        "description": "True-Cash +1% Spot Skimmer & Dip-or-Breakout Engine",
+        "description": "True-Cash +1% Spot Skimmer & Strict Cash-Isolation Rebuy Engine",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#060b16",
@@ -678,7 +744,7 @@ def service_worker():
 
 @app.route("/ping")
 def ping():
-    return jsonify({"ok": True, "service": "VaultSkimmer-v5.6", "cycle": STATE["cycle_count"]})
+    return jsonify({"ok": True, "service": "VaultSkimmer-v5.7", "cycle": STATE["cycle_count"]})
 
 
 @app.route("/api/cron")
@@ -770,12 +836,12 @@ def api_reset_vault():
     return jsonify({"ok": True})
 
 
-@app.route("/api/enable_pullback_shield", methods=["POST"])
-def api_enable_pullback_shield():
+@app.route("/api/enable_instant_rebuy", methods=["POST"])
+def api_enable_instant_rebuy():
     with state_lock:
         for sl in STATE["slots"].values():
-            sl["rebuy_pullback_pct"] = 0.30
-        add_log("🛡️ Activated Smart Rebuy Shield across all slots (-0.30% Dip OR +0.50% Breakout OR 180s Timeout).")
+            sl["rebuy_pullback_pct"] = 0.0
+        add_log("⚡ Activated Instant Rebuy (0% Pullback) with Strict Cash-Isolation across all active slots!")
         save_state()
     run_fleet_cycle(force_manual=True)
     return jsonify({"ok": True})
@@ -803,7 +869,7 @@ def api_add_or_update_slot():
     stop_reset_pct = max(0.5, float(raw_stop)) if raw_stop else 3.0
 
     raw_pb = str(data.get("rebuy_pullback_pct") or "").strip()
-    pullback_pct = max(0.0, float(raw_pb)) if raw_pb != "" else 0.30
+    pullback_pct = max(0.0, float(raw_pb)) if raw_pb != "" else 0.0
 
     raw_ep = str(data.get("entry_price") or "").strip()
     custom_ep = float(raw_ep) if (raw_ep and float(raw_ep) > 0) else 0.0
@@ -895,7 +961,7 @@ HTML_UI = """
   <meta name="theme-color" content="#060b16" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/svg+xml" href="/icon.svg" />
-  <title>VaultSkimmer v5.6 | Dip-or-Breakout Engine</title>
+  <title>VaultSkimmer v5.7 | Strict Cash-Isolation Engine</title>
   <style>
     :root {
       --bg: #050811;
@@ -1036,11 +1102,11 @@ HTML_UI = """
   <div class="hero">
     <div class="hero-top">
       <div>
-        <div class="brand-title">VaultSkimmer <span class="v-badge">v5.6 DIP-OR-BREAKOUT</span></div>
-        <div class="sub-desc">True-Cash Anti-Dust Guard • Smart Rebuy (-0.30% Dip OR +0.50% Breakout OR 180s Timeout)</div>
+        <div class="brand-title">VaultSkimmer <span class="v-badge">v5.7 STRICT CASH-LOCK</span></div>
+        <div class="sub-desc">Instant Rebuy Capped at Starting Cost • 100% of Skimmed Profit Stays in Gate.io USDT Wallet</div>
       </div>
       <div class="top-actions">
-        <button class="btn-install" onclick="enablePullbackShield()">🛡️ Enable Smart Rebuy Shield on All Slots</button>
+        <button class="btn-install" onclick="enableInstantRebuy()">⚡ Set All Slots to 0% Instant Rebuy</button>
         <button class="btn-scan" onclick="manualScan()" id="scanBtn">⚡ Scan All Now</button>
       </div>
     </div>
@@ -1076,7 +1142,7 @@ HTML_UI = """
 
   <div class="grid-4">
     <div class="card">
-      <div class="lbl">Total Protected Principal</div>
+      <div class="lbl">Total Active Slot Cost</div>
       <div class="val c-cyan" id="totalPrincipal">$0.00</div>
       <div class="sub">Live Fleet Value: <strong id="totalPosVal">$0.0000</strong></div>
     </div>
@@ -1149,8 +1215,8 @@ HTML_UI = """
       </div>
       <div class="row">
         <div>
-          <label>Rebuy Pullback % (Default = 0.30% Dip)</label>
-          <input type="number" id="pullbackInput" step="0.05" placeholder="0.30 = Dip or +0.5% Breakout" value="" autocomplete="off" />
+          <label>Rebuy Pullback % (Blank or 0 = Instant Rebuy)</label>
+          <input type="number" id="pullbackInput" step="0.05" placeholder="0 = Instant Rebuy" value="" autocomplete="off" />
         </div>
         <div>
           <label>Custom Entry Floor ($ — Blank = Auto)</label>
@@ -1211,14 +1277,14 @@ HTML_UI = """
     document.getElementById('principalInput').value = principal;
     document.getElementById('skimPctInput').value = skimPct;
     document.getElementById('stopResetInput').value = stopPct || 3.0;
-    document.getElementById('pullbackInput').value = pullback;
+    document.getElementById('pullbackInput').value = pullback || 0;
     document.getElementById('entryInput').value = '';
   }
 
-  async function enablePullbackShield() {
-    await fetch('/api/enable_pullback_shield', { method: 'POST' });
+  async function enableInstantRebuy() {
+    await fetch('/api/enable_instant_rebuy', { method: 'POST' });
     await refresh();
-    alert('🛡️ Smart Rebuy Shield enabled across all slots! After any +1% skim, the bot holds USDT until a -0.30% dip OR +0.50% breakout OR 180s timer.');
+    alert('⚡ All slots set to 0% Instant Rebuy! On every skim, the bot locks your profit in USDT and only spends the remaining initial cost on the instant rebuy.');
   }
 
   async function resetVault() {
@@ -1275,7 +1341,7 @@ HTML_UI = """
         principal_usdt: prin,
         skim_target_pct: skim,
         stop_reset_pct: stopPct || '3.0',
-        rebuy_pullback_pct: pb || '0.30',
+        rebuy_pullback_pct: pb !== '' ? pb : '0.0',
         entry_price: ep
       })
     });
@@ -1365,9 +1431,9 @@ HTML_UI = """
         modeText.innerText = 'PAPER SIM FLEET (' + keys.length + ' TOKENS)';
       }
 
-      let sumPrincipal = 0;
+      let sumCost = 0;
       let sumPosVal = 0;
-      const needBuf = Number(s.fee_buffer_pct || 0.25);
+      const needBuf = Number(s.fee_buffer_pct || 0.40);
 
       if (keys.length === 0) {
         document.getElementById('fleetContainer').innerHTML = `
@@ -1377,10 +1443,11 @@ HTML_UI = """
         const cardsHtml = keys.map(pair => {
           const sl = slots[pair];
           const p = Number(sl.principal_usdt || 0);
+          const cost = Number(sl.actual_cost_usdt || p);
           const pos = Number(sl.position_value_usdt || 0);
           const skimPct = Number(sl.skim_target_pct || 1.0);
           const stopPct = Number(sl.stop_reset_pct || 3.0);
-          sumPrincipal += p;
+          sumCost += cost;
           sumPosVal += pos;
 
           const needPct = skimPct + needBuf;
@@ -1392,7 +1459,7 @@ HTML_UI = """
               <div class="slot-top">
                 <div class="slot-pair">
                   <span>${pair}</span>
-                  <span class="slot-badge">$${p.toFixed(2)} Base</span>
+                  <span class="slot-badge">Cost: $${cost.toFixed(2)}</span>
                 </div>
                 <div style="font-size:0.78rem; font-weight:800;" class="${sl.unrealized_pnl_pct >= 0 ? 'c-green' : 'c-amber'}">
                   Live: ${fmtPx(sl.last_price)} (${pnlSign}${Number(sl.unrealized_pnl_pct).toFixed(2)}%)
@@ -1401,7 +1468,7 @@ HTML_UI = """
 
               <div class="slot-metrics">
                 <div>Entry Floor: <strong>${fmtPx(sl.entry_price)}</strong></div>
-                <div>+${skimPct}% Target: <strong class="c-cyan">${fmtPx(sl.target_sell_price)}</strong></div>
+                <div>+${skimPct}% Net Target: <strong class="c-cyan">${fmtPx(sl.target_sell_price)}</strong></div>
                 <div>-${stopPct}% Auto-Reset: <strong class="c-amber">${fmtPx(sl.stop_reset_price)}</strong></div>
                 <div>Slot Vaulted: <strong class="c-green">+$${Number(sl.slot_skimmed_usdt || 0).toFixed(4)} (${sl.slot_skim_count || 0})</strong></div>
               </div>
@@ -1413,7 +1480,7 @@ HTML_UI = """
               <div class="track"><div class="fill" style="width:${prog.toFixed(1)}%"></div></div>
 
               <div class="slot-actions">
-                <button class="s-btn" onclick="loadSlotToForm('${pair}', ${p}, ${skimPct}, ${stopPct}, ${sl.rebuy_pullback_pct || 0.3})">✏️ Edit</button>
+                <button class="s-btn" onclick="loadSlotToForm('${pair}', ${p}, ${skimPct}, ${stopPct}, ${sl.rebuy_pullback_pct || 0})">✏️ Edit</button>
                 <button class="s-btn" onclick="resetSlotEntry('${pair}')">🔄 Sync Entry</button>
                 <button class="s-btn s-btn-del" onclick="removeSlot('${pair}')">🗑️ Remove</button>
               </div>
@@ -1424,7 +1491,7 @@ HTML_UI = """
       }
 
       const freeUsdt = Number(s.usdt_balance || 0);
-      document.getElementById('totalPrincipal').innerText = '$' + sumPrincipal.toFixed(2);
+      document.getElementById('totalPrincipal').innerText = '$' + sumCost.toFixed(2);
       document.getElementById('totalPosVal').innerText = '$' + sumPosVal.toFixed(4);
       document.getElementById('totalPortfolioVal').innerText = '$' + (sumPosVal + freeUsdt).toFixed(4);
       document.getElementById('liveSkimmed').innerText = '+$' + Number(s.live_skimmed_usdt || 0).toFixed(4);
