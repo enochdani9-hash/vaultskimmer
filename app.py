@@ -5,7 +5,7 @@ import hmac
 import hashlib
 import threading
 from datetime import datetime
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry  
