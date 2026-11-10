@@ -893,8 +893,11 @@ HTML_UI = """
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#060b16" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/icon.svg" />
   <title>VaultSkimmer v5.6 | Dip-or-Breakout Engine</title>
   <style>
     :root {
@@ -928,6 +931,12 @@ HTML_UI = """
     .sub-desc { color: var(--muted); font-size: 0.8rem; margin-top: 4px; }
 
     .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .btn-pwa {
+      background: linear-gradient(135deg, #06b6d4, #3b82f6); color: #fff;
+      font-weight: 900; font-size: 0.79rem; padding: 9px 14px; border-radius: 10px; border: none;
+      cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+      box-shadow: 0 0 16px rgba(6, 182, 212, 0.35);
+    }
     .btn-install {
       background: linear-gradient(135deg, #10b981, #06b6d4); color: #022c22;
       font-weight: 900; font-size: 0.79rem; padding: 9px 14px; border-radius: 10px; border: none;
@@ -1040,6 +1049,7 @@ HTML_UI = """
         <div class="sub-desc">True-Cash Anti-Dust Guard • Smart Rebuy (-0.30% Dip OR +0.50% Breakout OR 180s Timeout)</div>
       </div>
       <div class="top-actions">
+        <button class="btn-pwa" onclick="triggerInstall()" id="installBtn">📲 Install App</button>
         <button class="btn-install" onclick="enablePullbackShield()">🛡️ Enable Smart Rebuy Shield on All Slots</button>
         <button class="btn-scan" onclick="manualScan()" id="scanBtn">⚡ Scan All Now</button>
       </div>
@@ -1194,6 +1204,29 @@ HTML_UI = """
 </div>
 
 <script>
+  let deferredPrompt = null;
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    });
+  }
+  window.addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();
+    deferredPrompt = e;
+  });
+
+  async function triggerInstall() {
+    if (deferredPrompt) {
+      deferredPrompt.prompt();
+      const { outcome } = await deferredPrompt.userChoice;
+      if (outcome === 'accepted') {
+        deferredPrompt = null;
+      }
+    } else {
+      alert('To install VaultSkimmer as an app: On Android/Chrome tap the 3-dots menu → "Install app" or "Add to Home screen". On Desktop Chrome/Edge click the Install icon in the right side of the address bar.');
+    }
+  }
+
   function fmtPx(val) {
     const v = Number(val || 0);
     if (v === 0) return '$0.0000';
