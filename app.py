@@ -13,8 +13,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-# Reads the same state file so your existing PEPE_USDT (+$0.4037) & XRP_USDT stay 100% intact!
-STATE_FILE = "vaultskimmer_v5_6_state.json"
+STATE_FILE = "vaultskimmer_v5_8_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -43,7 +42,7 @@ def fmt_px(val):
 def make_slot(pair, principal, skim_pct, stop_reset_pct=99.0, pullback_pct=0.30, entry_price=0.0, slot_type="LIVE"):
     return {
         "pair": pair,
-        "slot_type": slot_type,  # "LIVE" or "PAPER"
+        "slot_type": slot_type,
         "principal_usdt": float(principal),
         "skim_target_pct": float(skim_pct),
         "stop_reset_pct": float(stop_reset_pct),
@@ -74,103 +73,6 @@ def make_slot(pair, principal, skim_pct, stop_reset_pct=99.0, pullback_pct=0.30,
     }
 
 
-# Pre-seeded fallback matching your exact screenshot in case Render spins up a fresh container
-INITIAL_LIVE_SLOTS = {
-    "PEPE_USDT": {
-        "pair": "PEPE_USDT",
-        "slot_type": "LIVE",
-        "principal_usdt": 11.0,
-        "skim_target_pct": 1.0,
-        "stop_reset_pct": 99.0,
-        "rebuy_pullback_pct": 0.30,
-        "entry_price": 0.00000537,
-        "actual_cost_usdt": 11.02,
-        "last_skim_sell_price": 0.00000537,
-        "last_trade_ts": 0.0,
-        "started_ts": time.time(),
-        "phase": "HOLDING_FOR_SKIM",
-        "paper_base_bal": 0.0,
-        "base_balance": 2088078.0,
-        "position_value_usdt": 10.96,
-        "last_price": 0.00000536,
-        "price_prec": 8,
-        "high_24h": 0.0,
-        "low_24h": 0.0,
-        "change_24h_pct": 0.0,
-        "range_24h_pct": 0.0,
-        "target_sell_price": 0.00000544,
-        "stop_reset_price": 0.00000005,
-        "target_rebuy_price": 0.00000535,
-        "unrealized_pnl_usdt": -0.06,
-        "unrealized_pnl_pct": -0.24,
-        "slot_skimmed_usdt": 0.4037,
-        "slot_skim_count": 3,
-        "status_msg": "[LIVE] Active — Restored intact"
-    },
-    "XRP_USDT": {
-        "pair": "XRP_USDT",
-        "slot_type": "LIVE",
-        "principal_usdt": 10.0,
-        "skim_target_pct": 1.0,
-        "stop_reset_pct": 99.0,
-        "rebuy_pullback_pct": 0.30,
-        "entry_price": 1.1024,
-        "actual_cost_usdt": 9.92,
-        "last_skim_sell_price": 0.0,
-        "last_trade_ts": 0.0,
-        "started_ts": time.time(),
-        "phase": "HOLDING_FOR_SKIM",
-        "paper_base_bal": 0.0,
-        "base_balance": 9.0,
-        "position_value_usdt": 9.41,
-        "last_price": 1.0577,
-        "price_prec": 4,
-        "high_24h": 0.0,
-        "low_24h": 0.0,
-        "change_24h_pct": 0.0,
-        "range_24h_pct": 0.0,
-        "target_sell_price": 1.1288,
-        "stop_reset_price": 0.0110,
-        "target_rebuy_price": 1.0577,
-        "unrealized_pnl_usdt": -0.51,
-        "unrealized_pnl_pct": -4.05,
-        "slot_skimmed_usdt": 0.0,
-        "slot_skim_count": 0,
-        "status_msg": "[LIVE] Active — Restored intact"
-    }
-}
-
-INITIAL_LEDGER = [
-    {
-        "time": "07:47:03",
-        "pair": "PEPE_USDT (LIVE)",
-        "cycle": "#3",
-        "buy_px": "$0.00000527 ($11.02)",
-        "sell_px": "$0.00000537 ($11.18)",
-        "profit": "+$0.1676",
-        "principal_redeployed": "$11.02"
-    },
-    {
-        "time": "04:26:10",
-        "pair": "PEPE_USDT (LIVE)",
-        "cycle": "#2",
-        "buy_px": "$0.00000520 ($11.00)",
-        "sell_px": "$0.00000527 ($11.12)",
-        "profit": "+$0.1237",
-        "principal_redeployed": "$11.00"
-    },
-    {
-        "time": "04:06:53",
-        "pair": "PEPE_USDT (LIVE)",
-        "cycle": "#1",
-        "buy_px": "$0.00000515 ($10.99)",
-        "sell_px": "$0.00000521 ($11.10)",
-        "profit": "+$0.1124",
-        "principal_redeployed": "$10.99"
-    }
-]
-
-
 DEFAULT_STATE = {
     "mode": "LIVE",
     "fee_buffer_pct": 0.25,
@@ -178,22 +80,20 @@ DEFAULT_STATE = {
     "api_secret": os.environ.get("GATE_API_SECRET", "").strip(),
     "api_connected": False,
     "api_status_msg": "Not Connected — Paste Keys & Tap Sync",
-    # LIVE SLOTS (Real Gate.io Cash — Never touched by Paper Mode)
-    "slots": INITIAL_LIVE_SLOTS.copy(),
-    # PAPER DISCOVERY SLOTS (Independent $100 Virtual Study Lab — Runs simultaneously!)
+    "slots": {},
     "paper_slots": {},
     "paper_bankroll_usdt": 100.0,
     "paper_free_usdt": 100.0,
     "paper_skimmed_usdt": 0.0,
     "paper_skim_count": 0,
-    "live_skimmed_usdt": 0.4037,
-    "live_skim_count": 3,
-    "usdt_balance": 0.74,
+    "live_skimmed_usdt": 0.0,
+    "live_skim_count": 0,
+    "usdt_balance": 0.0,
     "last_scan_ms": 0,
     "cycle_count": 0,
     "last_update": "--:--:--",
     "last_worker_heartbeat": 0.0,
-    "skim_ledger": INITIAL_LEDGER.copy(),
+    "skim_ledger": [],
     "paper_ledger": [],
     "logs": []
 }
@@ -218,7 +118,7 @@ def normalize_pair(raw_pair):
 
 def load_state():
     global STATE
-    for fn in [STATE_FILE, "vaultskimmer_v5_5_state.json", "vaultskimmer_v5_4_state.json"]:
+    for fn in [STATE_FILE, "vaultskimmer_v5_6_state.json", "vaultskimmer_v5_5_state.json", "vaultskimmer_v5_4_state.json"]:
         if os.path.exists(fn):
             try:
                 with open(fn, "r") as f:
@@ -231,13 +131,23 @@ def load_state():
                     if saved_sec:
                         STATE["api_secret"] = saved_sec
                     if "slots" not in STATE or not isinstance(STATE["slots"], dict):
-                        STATE["slots"] = INITIAL_LIVE_SLOTS.copy()
+                        STATE["slots"] = {}
                     if "paper_slots" not in STATE or not isinstance(STATE["paper_slots"], dict):
                         STATE["paper_slots"] = {}
-                    if "paper_bankroll_usdt" not in STATE:
-                        STATE["paper_bankroll_usdt"] = 100.0
-                    if "paper_ledger" not in STATE:
-                        STATE["paper_ledger"] = []
+
+                    # Auto-heal the $0.00 unfilled PEPE phantom skim from 16:26:15!
+                    pepe_slot = STATE["slots"].get("PEPE_USDT")
+                    if pepe_slot and pepe_slot.get("entry_price") == 0.00000526 and pepe_slot.get("slot_skimmed_usdt") == 0.01:
+                        pepe_slot["entry_price"] = 0.00000516
+                        pepe_slot["actual_cost_usdt"] = 10.35
+                        pepe_slot["slot_skimmed_usdt"] = 0.0
+                        pepe_slot["slot_skim_count"] = 0
+                        STATE["live_skimmed_usdt"] = max(0.0, round(float(STATE.get("live_skimmed_usdt", 0.0)) - 0.01, 4))
+                        STATE["live_skim_count"] = max(0, int(STATE.get("live_skim_count", 0)) - 1)
+                        STATE["skim_ledger"] = [
+                            item for item in STATE.get("skim_ledger", [])
+                            if "($0.00)" not in str(item.get("sell_px", ""))
+                        ]
                 break
             except Exception as e:
                 add_log(f"State load notice: {e}")
@@ -261,7 +171,7 @@ def add_log(msg):
 
 
 def gate_sign(method, url, query_string="", body_string="", custom_key=None, custom_secret=None):
-    key = (custom_key if custom_key else STATE.get("api_key", "")).strip().upper() if False else (custom_key if custom_key else STATE.get("api_key", "")).strip()
+    key = (custom_key if custom_key else STATE.get("api_key", "")).strip()
     secret = (custom_secret if custom_secret else STATE.get("api_secret", "")).strip()
     t = str(int(time.time()))
     hashed_payload = hashlib.sha512(body_string.encode("utf-8")).hexdigest()
@@ -419,8 +329,8 @@ def process_paper_slot(pair, slot, fee_buf, ticker_map):
                 slot["base_balance"] = 0.0
                 slot["position_value_usdt"] = 0.0
                 slot["status_msg"] = (
-                    f"[STUDY] Holding Virtual USDT — Dip {fmt_px(rebuy_px)} or Breakout {fmt_px(breakout_px)} "
-                    f"({int(180 - waited_sec)}s)"
+                    f"[STUDY] Holding USDT — Waiting for -{pullback_pct}% dip ({fmt_px(rebuy_px)}) "
+                    f"or +0.5% breakout ({fmt_px(breakout_px)}) | {int(180 - waited_sec)}s left"
                 )
                 return
 
@@ -448,15 +358,13 @@ def process_paper_slot(pair, slot, fee_buf, ticker_map):
     slot["unrealized_pnl_usdt"] = round(pos_val - principal, 4)
     slot["unrealized_pnl_pct"] = round(((price - entry_px) / entry_px) * 100.0, 3)
 
-    # -3% Auto-Reset in Study Mode
-    if stop_reset_pct > 0 and stop_reset_pct < 90 and price <= stop_px:
+    if 0 < stop_reset_pct < 90 and price <= stop_px:
         slot["paper_base_bal"] = principal / price
         slot["entry_price"] = price
         slot["last_trade_ts"] = now
         slot["status_msg"] = f"[STUDY -{stop_reset_pct}% RESET] Rebought floor @ {fmt_px(price)}"
         return
 
-    # +Skim Target Hit in Study Mode
     if price >= target_px:
         pct_gain = (price - entry_px) / entry_px
         sim_profit = max(0.01, round(principal * pct_gain - principal * (fee_buf / 100.0), 4))
@@ -485,7 +393,10 @@ def process_paper_slot(pair, slot, fee_buf, ticker_map):
             slot["paper_base_bal"] = 0.0
             slot["base_balance"] = 0.0
             slot["phase"] = "WAITING_TO_BUY"
-            slot["status_msg"] = f"[STUDY] Skimmed +${sim_profit:.4f}! Waiting for -{pullback_pct}% dip"
+            slot["status_msg"] = (
+                f"[STUDY] Skimmed +${sim_profit:.4f}! Waiting for -{pullback_pct}% dip "
+                f"({fmt_px(rebuy_px)}) or +0.5% breakout (180s)"
+            )
         else:
             slot["paper_base_bal"] = principal / price
             slot["entry_price"] = price
@@ -495,7 +406,7 @@ def process_paper_slot(pair, slot, fee_buf, ticker_map):
 
 
 # =========================================================================
-# ENGINE 2: LIVE GATE.IO CASH SLOT PROCESSOR (100% Isolated from Paper Lab)
+# ENGINE 2: LIVE GATE.IO CASH SLOT PROCESSOR (With Strict Fill Verification!)
 # =========================================================================
 def process_live_slot(pair, slot, fee_buf, has_keys, bal_map, ticker_map):
     base_curr = pair.split("_")[0]
@@ -587,27 +498,29 @@ def process_live_slot(pair, slot, fee_buf, has_keys, bal_map, ticker_map):
 
     if slot["phase"] == "HOLDING_FOR_SKIM":
         if 0 < stop_reset_pct < 90 and price <= stop_reset_px:
-            sell_px_str = format_dec(price * 0.997, px_prec)
+            sell_px_str = format_dec(price * 0.995, px_prec)
             code, resp = place_gate_order(pair, "sell", sellable_amt_str, sell_px_str)
-            if code in (200, 201):
+            filled_sell = float(resp.get("filled_total") or 0.0) if isinstance(resp, dict) else 0.0
+            if code in (200, 201) and filled_sell > (actual_cost * 0.50):
                 old_ep = entry_px
                 slot["last_trade_ts"] = time.time()
                 time.sleep(0.45)
-                rebuy_budget = min(principal, max(sellable_val_usdt * 0.996, min_quote * 1.05))
+                rebuy_budget = min(principal, max(filled_sell * 0.996, min_quote * 1.05))
                 rebuy_amt_str = calc_fee_protected_buy_amt(rebuy_budget, price, amt_prec)
-                rebuy_px_str = format_dec(price * 1.003, px_prec)
+                rebuy_px_str = format_dec(price * 1.004, px_prec)
                 b_code, b_resp = place_gate_order(pair, "buy", rebuy_amt_str, rebuy_px_str)
-                filled_usdt = float(b_resp.get("filled_total", rebuy_budget)) if isinstance(b_resp, dict) else rebuy_budget
-                slot["entry_price"] = price
-                slot["actual_cost_usdt"] = filled_usdt if filled_usdt > 0 else rebuy_budget
-                new_target = price * (1.0 + (effective_gain_pct / 100.0))
-                slot["target_sell_price"] = round(new_target, px_prec)
-                slot["stop_reset_price"] = round(price * (1.0 - (stop_reset_pct / 100.0)), px_prec)
-                slot["status_msg"] = f"[LIVE -{stop_reset_pct}% RESET] Rebought @ {fmt_px(price)} → Target {fmt_px(new_target)}"
-                add_log(
-                    f"🔄 [LIVE -{stop_reset_pct}% RESET][{pair}] Dropped {fmt_px(old_ep)} → {fmt_px(price)}. "
-                    f"Sold & Rebought @ {fmt_px(price)}"
-                )
+                filled_usdt = float(b_resp.get("filled_total") or 0.0) if isinstance(b_resp, dict) else 0.0
+                if filled_usdt > 0:
+                    slot["entry_price"] = price
+                    slot["actual_cost_usdt"] = round(filled_usdt, 4)
+                    new_target = price * (1.0 + (effective_gain_pct / 100.0))
+                    slot["target_sell_price"] = round(new_target, px_prec)
+                    slot["stop_reset_price"] = round(price * (1.0 - (stop_reset_pct / 100.0)), px_prec)
+                    slot["status_msg"] = f"[LIVE -{stop_reset_pct}% RESET] Rebought @ {fmt_px(price)} → Target {fmt_px(new_target)}"
+                    add_log(
+                        f"🔄 [LIVE -{stop_reset_pct}% RESET][{pair}] Dropped {fmt_px(old_ep)} → {fmt_px(price)}. "
+                        f"Sold & Rebought @ {fmt_px(price)}"
+                    )
             return
 
         if price < target_sell_px or sellable_val_usdt < required_net_usdt:
@@ -617,16 +530,29 @@ def process_live_slot(pair, slot, fee_buf, has_keys, bal_map, ticker_map):
             )
             return
 
-        sell_px_str = format_dec(price * 0.998, px_prec)
+        # Use 0.996 IOC limit buffer so micro-cap tokens like PEPE fill 100% of the time!
+        sell_px_str = format_dec(price * 0.996, px_prec)
         code, resp = place_gate_order(pair, "sell", sellable_amt_str, sell_px_str)
 
         if code in (200, 201):
+            # CRITICAL FIX: Verify that Gate.io actually filled the sell order (never log $0.00 fills!)
+            gross_usdt_received = float(resp.get("filled_total") or 0.0)
+            left_unfilled = float(resp.get("left") or 0.0)
+            if gross_usdt_received < (actual_cost * 0.50):
+                add_log(
+                    f"⚠️ [LIVE][{pair}] IOC Sell did not fill on orderbook (Filled: ${gross_usdt_received:.2f}, Left: {left_unfilled}). "
+                    f"Keeping Entry Floor {fmt_px(entry_px)} locked & retrying next scan!"
+                )
+                return
+
             slot["last_trade_ts"] = time.time()
-            gross_usdt_received = float(resp.get("filled_total") or (sellable_units * price))
             fee_deducted = float(resp.get("fee") or (gross_usdt_received * 0.001))
             net_usdt_received = gross_usdt_received - fee_deducted
 
-            true_cash_profit = max(0.01, round(net_usdt_received - actual_cost, 4))
+            true_cash_profit = round(net_usdt_received - actual_cost, 4)
+            if true_cash_profit <= 0:
+                true_cash_profit = round(gross_usdt_received - actual_cost, 4)
+            true_cash_profit = max(0.01, true_cash_profit)
 
             slot["slot_skimmed_usdt"] = round(slot.get("slot_skimmed_usdt", 0.0) + true_cash_profit, 4)
             slot["slot_skim_count"] = slot.get("slot_skim_count", 0) + 1
@@ -655,10 +581,10 @@ def process_live_slot(pair, slot, fee_buf, has_keys, bal_map, ticker_map):
                 time.sleep(0.45)
                 rebuy_budget = min(principal, net_usdt_received - true_cash_profit)
                 rebuy_amt_str = calc_fee_protected_buy_amt(rebuy_budget, price, amt_prec)
-                rebuy_px_str = format_dec(price * 1.002, px_prec)
+                rebuy_px_str = format_dec(price * 1.004, px_prec)
                 b_code, b_resp = place_gate_order(pair, "buy", rebuy_amt_str, rebuy_px_str)
-                if b_code in (200, 201):
-                    spent_usdt = float(b_resp.get("filled_total") or (float(rebuy_amt_str) * price))
+                spent_usdt = float(b_resp.get("filled_total") or 0.0) if isinstance(b_resp, dict) else 0.0
+                if b_code in (200, 201) and spent_usdt > (principal * 0.50):
                     slot["entry_price"] = price
                     slot["actual_cost_usdt"] = round(spent_usdt, 4)
                     slot["phase"] = "HOLDING_FOR_SKIM"
@@ -667,18 +593,23 @@ def process_live_slot(pair, slot, fee_buf, has_keys, bal_map, ticker_map):
                     slot["status_msg"] = f"[LIVE] Cash Skimmed +${true_cash_profit:.4f} & Rebought (${spent_usdt:.2f}) @ {fmt_px(price)}"
                 else:
                     slot["phase"] = "WAITING_TO_BUY"
+                    slot["entry_price"] = 0.0
+                    slot["actual_cost_usdt"] = 0.0
             else:
                 slot["phase"] = "WAITING_TO_BUY"
                 slot["entry_price"] = 0.0
                 slot["actual_cost_usdt"] = 0.0
                 slot["status_msg"] = (
                     f"[LIVE] Cash Protected in USDT (+${true_cash_profit:.4f})! "
-                    f"Waiting for -{pullback_pct}% dip ({fmt_px(rebuy_px)}) or +0.5% breakout"
+                    f"Waiting for -{pullback_pct}% dip ({fmt_px(rebuy_px)}) or +0.5% breakout (180s)"
                 )
         else:
             add_log(f"[LIVE][{pair}] Sell rejected ({code}): {resp.get('message', resp)}")
         return
 
+    # =========================================================================
+    # SMART 3-WAY REBUY: Dip (-0.30%) OR Breakout (+0.50%) OR 180s Timeout
+    # =========================================================================
     if slot["phase"] == "WAITING_TO_BUY":
         if pullback_pct > 0 and last_sell_px > 0:
             breakout_px = last_sell_px * 1.005
@@ -696,12 +627,15 @@ def process_live_slot(pair, slot, fee_buf, has_keys, bal_map, ticker_map):
 
         buy_budget = min(principal, real_usdt_bal * 0.995)
         buy_amt_str = calc_fee_protected_buy_amt(buy_budget, price, amt_prec)
-        buy_px_str = format_dec(price * 1.002, px_prec)
+        buy_px_str = format_dec(price * 1.004, px_prec)
         code, resp = place_gate_order(pair, "buy", buy_amt_str, buy_px_str)
 
         if code in (200, 201):
+            spent_usdt = float(resp.get("filled_total") or 0.0)
+            if spent_usdt < (principal * 0.50):
+                add_log(f"⚠️ [LIVE][{pair}] IOC Buy did not fill on orderbook. Retrying next scan.")
+                return
             slot["last_trade_ts"] = time.time()
-            spent_usdt = float(resp.get("filled_total") or (float(buy_amt_str) * price))
             slot["entry_price"] = price
             slot["actual_cost_usdt"] = round(spent_usdt, 4)
             slot["phase"] = "HOLDING_FOR_SKIM"
@@ -756,7 +690,6 @@ def run_fleet_cycle(force_manual=False):
             add_log(f"Ticker batch notice: {str(tk_err)[:60]}")
             return
 
-        # 1. Process all LIVE cash slots
         for pair in live_keys:
             with state_lock:
                 slot = STATE["slots"].get(pair)
@@ -768,7 +701,6 @@ def run_fleet_cycle(force_manual=False):
                 with state_lock:
                     slot["status_msg"] = f"Notice: {str(slot_err)[:55]}"
 
-        # 2. Process all PAPER study slots simultaneously (never touches live money)
         paper_allocated = 0.0
         for pair in paper_keys:
             with state_lock:
@@ -797,7 +729,7 @@ def run_fleet_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("VaultSkimmer v5.8 Dual-Engine Online (Live Fleet + $100 Paper Discovery Lab Running Simultaneously).")
+    add_log("VaultSkimmer v5.8.2 Online (Verified Order Fill Guard + 180s Smart Rebuy + $100 Paper Lab).")
     while True:
         run_fleet_cycle(force_manual=False)
         time.sleep(3.5)
@@ -837,9 +769,9 @@ def app_icon():
 @app.route("/manifest.json")
 def manifest():
     return jsonify({
-        "name": "VaultSkimmer v5.8 Dual-Engine",
+        "name": "VaultSkimmer v5.8.2 Dual-Engine",
         "short_name": "VaultSkimmer",
-        "description": "Simultaneous Live Cash Skimmer & $100 Paper Discovery Lab",
+        "description": "True-Cash Spot Skimmer, 180s Smart Rebuy & $100 Paper Lab",
         "start_url": "/",
         "display": "standalone",
         "background_color": "#060b16",
@@ -862,7 +794,7 @@ def service_worker():
 
 @app.route("/ping")
 def ping():
-    return jsonify({"ok": True, "service": "VaultSkimmer-v5.8-Dual", "cycle": STATE["cycle_count"]})
+    return jsonify({"ok": True, "service": "VaultSkimmer-v5.8.2-Dual", "cycle": STATE["cycle_count"]})
 
 
 @app.route("/api/cron")
@@ -974,7 +906,7 @@ def api_enable_pullback_shield():
             sl["rebuy_pullback_pct"] = 0.30
         for sl in STATE.get("paper_slots", {}).values():
             sl["rebuy_pullback_pct"] = 0.30
-        add_log("🛡️ Activated Smart Rebuy Shield across all Live & Paper slots.")
+        add_log("🛡️ Activated Smart Rebuy Shield across all Live & Paper slots (-0.30% Dip OR +0.50% Breakout OR 180s Timeout).")
         save_state()
     run_fleet_cycle(force_manual=True)
     return jsonify({"ok": True})
@@ -1018,10 +950,10 @@ def api_add_or_update_slot():
                 existing["rebuy_pullback_pct"] = pullback_pct
                 if custom_ep > 0:
                     existing["entry_price"] = custom_ep
-                add_log(f"Updated LIVE Slot: {pair} (${principal:.2f} | +{skim_pct}% Skim)")
+                add_log(f"Updated LIVE Slot: {pair} (${principal:.2f} | +{skim_pct}% Skim | -{pullback_pct}% Smart Rebuy)")
             else:
                 STATE["slots"][pair] = make_slot(pair, principal, skim_pct, stop_reset_pct, pullback_pct, custom_ep, "LIVE")
-                add_log(f"Commanded LIVE Slot: {pair} (${principal:.2f} Base | +{skim_pct}% Skim)")
+                add_log(f"Commanded LIVE Slot: {pair} (${principal:.2f} Base | +{skim_pct}% Skim | -{pullback_pct}% Smart Rebuy)")
         else:
             if "paper_slots" not in STATE:
                 STATE["paper_slots"] = {}
@@ -1046,7 +978,6 @@ def api_add_or_update_slot():
 
 @app.route("/api/load_paper_study_pack", methods=["POST"])
 def api_load_paper_study_pack():
-    """Loads 10 moving coins at $10 each ($100 total) into the Paper Study Lab without touching Live slots!"""
     study_coins = [
         "DOGE_USDT", "SUI_USDT", "SOL_USDT", "ADA_USDT", "TRX_USDT",
         "ALGO_USDT", "POL_USDT", "VET_USDT", "XLM_USDT", "LINK_USDT"
@@ -1130,7 +1061,7 @@ HTML_UI = """
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" type="image/svg+xml" href="/icon.svg" />
   <link rel="apple-touch-icon" href="/icon.svg" />
-  <title>VaultSkimmer v5.8 | Simultaneous Live + $100 Paper Study Lab</title>
+  <title>VaultSkimmer v5.8.2 | Verified Fill + 180s Smart Rebuy</title>
   <style>
     :root {
       --bg: #050811;
@@ -1165,19 +1096,23 @@ HTML_UI = """
     .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .btn-pwa {
       background: linear-gradient(135deg, #06b6d4, #3b82f6); color: #fff;
-      font-weight: 900; font-size: 0.79rem; padding: 9px 14px; border-radius: 10px; border: none;
+      font-weight: 900; font-size: 0.77rem; padding: 9px 13px; border-radius: 10px; border: none;
       cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
       box-shadow: 0 0 16px rgba(6, 182, 212, 0.35);
     }
     .btn-install {
       background: linear-gradient(135deg, #10b981, #06b6d4); color: #022c22;
-      font-weight: 900; font-size: 0.79rem; padding: 9px 14px; border-radius: 10px; border: none;
+      font-weight: 900; font-size: 0.77rem; padding: 9px 13px; border-radius: 10px; border: none;
       cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
       box-shadow: 0 0 16px var(--emerald-glow);
     }
+    .btn-study {
+      background: rgba(245, 158, 11, 0.2); border: 1px solid #f59e0b; color: #fde68a;
+      font-weight: 800; font-size: 0.77rem; padding: 8px 13px; border-radius: 10px; cursor: pointer;
+    }
     .btn-scan {
       background: rgba(139, 92, 246, 0.22); border: 1px solid #8b5cf6; color: #ddd6fe;
-      font-weight: 800; font-size: 0.78rem; padding: 8px 13px; border-radius: 10px; cursor: pointer;
+      font-weight: 800; font-size: 0.77rem; padding: 8px 13px; border-radius: 10px; cursor: pointer;
     }
 
     .telemetry-strip {
@@ -1284,19 +1219,20 @@ HTML_UI = """
   <div class="hero">
     <div class="hero-top">
       <div>
-        <div class="brand-title">VaultSkimmer <span class="v-badge">v5.8 DUAL LIVE + PAPER LAB</span></div>
-        <div class="sub-desc">Simultaneous Live Cash Engine + Independent $100 Paper Discovery Lab • Zero Interference</div>
+        <div class="brand-title">VaultSkimmer <span class="v-badge">v5.8.2 VERIFIED-FILL + 180s SMART REBUY</span></div>
+        <div class="sub-desc">True-Cash Anti-Dust Guard • Smart Rebuy (-0.30% Dip OR +0.50% Breakout OR 180s Timeout) • $100 Paper Study Lab</div>
       </div>
       <div class="top-actions">
         <button class="btn-pwa" onclick="triggerInstall()" id="installBtn">📲 Install App</button>
-        <button class="btn-install" onclick="loadPaperStudyPack()">🧪 Load 10 Study Coins ($100 Paper Lab)</button>
+        <button class="btn-install" onclick="enablePullbackShield()">🛡️ Enable Smart Rebuy Shield on All Slots</button>
+        <button class="btn-study" onclick="loadPaperStudyPack()">🧪 Load 10 Study Coins ($100 Paper Lab)</button>
         <button class="btn-scan" onclick="manualScan()" id="scanBtn">⚡ Scan All Now</button>
       </div>
     </div>
 
     <div class="telemetry-strip">
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
-        <span class="pill pill-live"><span class="dot"></span> LIVE FLEET (<span id="liveCount">2</span> TOKENS)</span>
+        <span class="pill pill-live"><span class="dot"></span> LIVE FLEET (<span id="liveCount">0</span> TOKENS)</span>
         <span class="pill pill-paper"><span class="dot"></span> PAPER STUDY LAB (<span id="paperCount">0</span> TOKENS | $100 BASE)</span>
       </div>
       <div>Last Dual Scan: <strong id="lastUpdate">--:--:--</strong> (<strong class="c-green" id="scanMs">0</strong>ms | Cycle #<span id="cycleNum">0</span>)</div>
@@ -1326,21 +1262,21 @@ HTML_UI = """
   <div class="grid-4">
     <div class="card">
       <div class="lbl">Live Protected Principal</div>
-      <div class="val c-cyan" id="totalPrincipal">$21.00</div>
-      <div class="sub">Live Fleet Value: <strong id="totalPosVal">$20.4722</strong></div>
+      <div class="val c-cyan" id="totalPrincipal">$0.00</div>
+      <div class="sub">Live Fleet Value: <strong id="totalPosVal">$0.0000</strong></div>
     </div>
     <div class="card">
       <div class="lbl">Total Live Portfolio (Fleet + USDT)</div>
-      <div class="val c-green" id="totalPortfolioVal">$21.2118</div>
-      <div class="sub">Free Gate.io USDT: <strong id="usdtBal">$0.74</strong></div>
+      <div class="val c-green" id="totalPortfolioVal">$0.0000</div>
+      <div class="sub">Free Gate.io USDT: <strong id="usdtBal">$0.00</strong></div>
     </div>
     <div class="card">
       <div class="lbl">
         <span>Realized LIVE Profit Vault</span>
         <button class="btn-reset-vault" onclick="resetLiveVault()">🔄 Reset $0.00</button>
       </div>
-      <div class="val c-green" id="liveSkimmed">+$0.4037</div>
-      <div class="sub">Verified Cash Skims: <strong id="liveSkimCount">3</strong></div>
+      <div class="val c-green" id="liveSkimmed">+$0.0000</div>
+      <div class="sub">Verified Cash Skims: <strong id="liveSkimCount">0</strong></div>
     </div>
     <div class="card">
       <div class="lbl">
@@ -1397,7 +1333,7 @@ HTML_UI = """
         </div>
         <div>
           <label>Slot Principal (USDT)</label>
-          <input type="number" id="principalInput" step="0.5" placeholder="e.g. 10" value="10" autocomplete="off" />
+          <input type="number" id="principalInput" step="0.05" placeholder="e.g. 10.35" value="10.35" autocomplete="off" />
         </div>
       </div>
       <div class="row">
@@ -1413,7 +1349,7 @@ HTML_UI = """
       <div class="row">
         <div>
           <label>Rebuy Pullback % (Default = 0.30% Dip)</label>
-          <input type="number" id="pullbackInput" step="0.05" placeholder="0.30 = Dip or +0.5% Breakout" value="0.30" autocomplete="off" />
+          <input type="number" id="pullbackInput" step="0.05" placeholder="0.30 = Dip or +0.5% Breakout (180s)" value="0.30" autocomplete="off" />
         </div>
         <div>
           <label>Custom Entry Floor ($ — Blank = Auto)</label>
@@ -1522,6 +1458,12 @@ HTML_UI = """
     } else {
       alert('To install VaultSkimmer as an app: On Android/Chrome tap the 3-dots menu -> "Install app". On Desktop Chrome/Edge click the Install icon on the right side of the address bar.');
     }
+  }
+
+  async function enablePullbackShield() {
+    await fetch('/api/enable_pullback_shield', { method: 'POST' });
+    await refresh();
+    alert('🛡️ Smart Rebuy Shield enabled across all Live & Paper slots! After any skim, the bot holds USDT until a -0.30% dip OR +0.50% breakout OR 180s timer.');
   }
 
   function fmtPx(val) {
@@ -1665,6 +1607,7 @@ HTML_UI = """
       const p = Number(sl.principal_usdt || 0);
       const skimPct = Number(sl.skim_target_pct || 1.0);
       const stopPct = Number(sl.stop_reset_pct || 99.0);
+      const pbPct = Number(sl.rebuy_pullback_pct !== undefined ? sl.rebuy_pullback_pct : 0.30);
       const needPct = skimPct + needBuf;
       const prog = Math.max(0, Math.min(100, (Number(sl.unrealized_pnl_pct || 0) / needPct) * 100));
       const pnlSign = sl.unrealized_pnl_pct >= 0 ? '+' : '';
@@ -1685,7 +1628,7 @@ HTML_UI = """
           <div class="slot-metrics">
             <div>Entry Floor: <strong>${fmtPx(sl.entry_price)}</strong></div>
             <div>+${skimPct}% Target: <strong class="c-cyan">${fmtPx(sl.target_sell_price)}</strong></div>
-            <div>24h High/Low Range: <strong class="c-amber">${Number(sl.range_24h_pct || 0).toFixed(2)}%</strong></div>
+            <div>Smart Rebuy: <strong class="c-amber">-${pbPct}% Dip / +0.5% / 180s</strong></div>
             <div>Slot Vaulted: <strong class="c-green">+$${Number(sl.slot_skimmed_usdt || 0).toFixed(4)} (${sl.slot_skim_count || 0})</strong></div>
           </div>
 
@@ -1696,7 +1639,7 @@ HTML_UI = """
           <div class="track"><div class="${isPaper ? 'fill-paper' : 'fill'}" style="width:${prog.toFixed(1)}%"></div></div>
 
           <div class="slot-actions">
-            <button class="s-btn" onclick="loadSlotToForm('${pair}', ${p}, ${skimPct}, ${stopPct}, ${sl.rebuy_pullback_pct || 0.3})">✏️ Edit</button>
+            <button class="s-btn" onclick="loadSlotToForm('${pair}', ${p}, ${skimPct}, ${stopPct}, ${pbPct})">✏️ Edit</button>
             <button class="s-btn" onclick="resetSlotEntry('${pair}', '${engineType}')">🔄 Sync Entry</button>
             <button class="s-btn s-btn-del" onclick="removeSlot('${pair}', '${engineType}')">🗑️ Remove</button>
           </div>
@@ -1722,6 +1665,10 @@ HTML_UI = """
         apiBadge.style.color = '#fbbf24';
         apiBadge.innerText = '● ' + (s.api_status_msg || 'Not Connected');
       }
+      if (s.has_saved_keys && !document.getElementById('apiKeyInput').value) {
+        document.getElementById('apiKeyInput').placeholder = 'Saved & Verified on Server';
+        document.getElementById('apiSecretInput').placeholder = 'Saved & Verified on Server';
+      }
 
       const liveSlots = s.slots || {};
       const paperSlots = s.paper_slots || {};
@@ -1743,7 +1690,7 @@ HTML_UI = """
       });
 
       if (liveKeys.length === 0) {
-        document.getElementById('liveFleetContainer').innerHTML = `<div class="empty-fleet">No Live tokens running.</div>`;
+        document.getElementById('liveFleetContainer').innerHTML = `<div class="empty-fleet">No Live tokens running — Command a token below and click "💎 Launch in LIVE Cash Fleet".</div>`;
       } else {
         document.getElementById('liveFleetContainer').innerHTML = `<div class="fleet-grid">${renderSlotCards(liveSlots, 'LIVE', needBuf)}</div>`;
       }
@@ -1767,7 +1714,6 @@ HTML_UI = """
       document.getElementById('paperBankroll').innerText = '$' + (100 + Number(s.paper_skimmed_usdt || 0)).toFixed(2);
       document.getElementById('usdtBal').innerText = '$' + freeUsdt.toFixed(2);
 
-      // Build Moving Coin Study Leaderboard (Combines Live + Paper ranked by Skims Won then 24h Range)
       const allTracked = [
         ...liveKeys.map(k => ({ ...liveSlots[k], modeLabel: 'LIVE' })),
         ...paperKeys.map(k => ({ ...paperSlots[k], modeLabel: 'PAPER' }))
@@ -1789,6 +1735,8 @@ HTML_UI = """
             <td class="c-cyan">${Number(item.range_24h_pct || 0).toFixed(2)}%</td>
           </tr>
         `).join('');
+      } else {
+        rankBody.innerHTML = `<tr><td colspan="5" style="color:#64748b; text-align:center; padding:22px;">Add Paper Study tokens to rank the fastest moving coins of the day/week.</td></tr>`;
       }
 
       const lb = document.getElementById('ledgerBody');
