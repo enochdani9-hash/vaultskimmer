@@ -234,7 +234,6 @@ def place_spot_market_sell(pair, coin_qty):
     prec = meta["amount_precision"]
     base_coin = pair.split("_")[0]
 
-    # Check actual available coin balance to avoid dust rejections
     try:
         bals = fetch_spot_accounts()
         avail_coin = float(bals.get(base_coin, 0.0))
@@ -282,12 +281,6 @@ def calc_rsi(closes, period=14):
 
 
 def compute_bull_score(pair, tk):
-    """
-    Computes a 0-100 Bullish Bounce/Breakout Score:
-    - Avoids overbought tops (RSI > 72).
-    - Rewards strong Bid Buy Walls (Buyers % > Sellers %), lower-wick dip bounces,
-      and healthy upward momentum.
-    """
     now = time.time()
     cached = BULL_RADAR_CACHE.get(pair)
     if cached and (now - cached["ts"] < 14.0):
@@ -307,7 +300,6 @@ def compute_bull_score(pair, tk):
         )
         if c_resp.status_code == 200:
             raw = c_resp.json()
-            # Gate.io Spot candlesticks: [ts, quote_vol, close, high, low, open, ...]
             closes = [float(c[2]) for c in raw if len(c) >= 6]
             highs = [float(c[3]) for c in raw if len(c) >= 6]
             lows = [float(c[4]) for c in raw if len(c) >= 6]
@@ -368,15 +360,6 @@ def compute_bull_score(pair, tk):
     return res
 
 
-# =============================================================================
-# MAIN EXECUTION ENGINE — VAULTSKIMMER v4.2 PRO (SPOT BULLISH EDITION)
-# 1) ACTIVE_LONG:
-#    - Pumps +1.40% (or +2.60% in recovery) -> Trails green peak -> Sells, locks profit, re-buys base!
-#    - Dumps -3.5% -> Sells into USDT & enters STEPPED_OUT_HOLD (no more -15% stuck bags!).
-# 2) STEPPED_OUT_HOLD:
-#    - Tracks lowest `bottom_watch_price` while holding safe USDT.
-#    - On +1.0% bounce off bottom -> Pulls shortfall from Reserve -> Restores full $10 & Re-Buys!
-# =============================================================================
 def run_bull_cycle(force_manual=False):
     if not cycle_lock.acquire(blocking=force_manual):
         return
@@ -431,9 +414,6 @@ def run_bull_cycle(force_manual=False):
             margin_usdt = float(pos["margin_usdt"])
             base_slot = float(pos.get("base_slot_usdt") or 10.0)
 
-            # =================================================================
-            # PHASE 2: STEPPED_OUT_HOLD (Holding safe USDT, watching bottom)
-            # =================================================================
             if phase == "STEPPED_OUT_HOLD":
                 bottom_px = float(pos.get("bottom_watch_price") or live_px)
                 if live_px < bottom_px:
@@ -522,9 +502,6 @@ def run_bull_cycle(force_manual=False):
                     )
                 continue
 
-            # =================================================================
-            # PHASE 1: ACTIVE_LONG (Monitoring for Pump Target OR -3.5% Dump)
-            # =================================================================
             entry_px = float(pos["entry_price"])
             borrowed_now = float(pos.get("borrowed_from_reserve_usdt", 0.0))
             in_rec = bool(pos.get("in_recovery", False)) or (borrowed_now > 0.01)
@@ -547,7 +524,6 @@ def run_bull_cycle(force_manual=False):
             pos["pnl_usdt"] = round(net_pnl_usdt, 4)
             pos["current_equity_usdt"] = round(margin_usdt + net_pnl_usdt, 4)
 
-            # 1) CHECK -3.5% ANTI-WHIPSAW DUMP ESCAPE HATCH
             if coin_move_pct <= -escape_dump_pct:
                 held_cash = round(margin_usdt * (1.0 - ((escape_dump_pct + (fee_buf / 2.0)) / 100.0)), 4)
                 reentry_px = live_px * (1.0 + (reentry_bounce_pct / 100.0))
@@ -593,7 +569,6 @@ def run_bull_cycle(force_manual=False):
                             )
                         continue
 
-            # 2) CHECK IF PUMP TARGET (+1.40% Normal or +2.60% Recovery) IS REACHED
             should_skim_and_rebuy = False
             if live_px >= target_sell_px:
                 if not pos.get("trailing_active"):
@@ -621,7 +596,6 @@ def run_bull_cycle(force_manual=False):
                         f"-{escape_dump_pct}% Shield @ {fmt_px(escape_stop_px)}"
                     )
 
-            # 3) EXECUTE SKIM WITH CARRY-OVER RECOVERY & RE-BUY BASE SLOT
             if should_skim_and_rebuy:
                 gross_gain_usdt = max(0.02, round(margin_usdt * (max(active_skim_goal_pct, net_pnl_pct) / 100.0), 4))
                 borrowed_res = float(pos.get("borrowed_from_reserve_usdt", 0.0))
@@ -685,10 +659,8 @@ def run_bull_cycle(force_manual=False):
                         pos["status"] = f"Cycle #{pos['slot_skims']} Done — Re-Bought ${base_slot:.2f} @ {fmt_px(live_px)}"
 
                 elif mode == "LIVE" and has_keys:
-                    # 1) Sell Spot Bag to realize USDT profit
                     code_s, resp_s = place_spot_market_sell(pair, float(pos.get("coin_qty", 0.0)))
                     if code_s in (200, 201):
-                        # 2) Immediately re-buy base_slot USDT for the next bullish cycle
                         code_b, resp_b = place_spot_market_buy(pair, base_slot)
                         new_qty = float(resp_b.get("filled_amount") or (base_slot / live_px)) if code_b in (200, 201) else 0.0
                         new_entry = float(resp_b.get("avg_deal_price") or live_px) if code_b in (200, 201) else live_px
@@ -825,7 +797,6 @@ def api_toggle_mode():
 
 @app.route("/api/sync_live_positions", methods=["POST"])
 def api_sync_live_positions():
-    """Imports existing Gate.io Spot coin bags worth >= $2.00 into VaultSkimmer v4.2 PRO."""
     if not STATE.get("api_key") or not STATE.get("api_secret"):
         return jsonify({"ok": False, "error": "Sync your Gate.io API Keys first!"}), 400
     try:
@@ -934,6 +905,27 @@ def api_reset_profit_vault():
         add_log("🧹 Reset Locked Profit Vault & Skim Ledger to $0.0000.")
         save_state()
     return jsonify({"ok": True})
+
+
+@app.route("/api/reset_true_net_profit", methods=["POST"])
+def api_reset_true_net_profit():
+    """Resets True Net Profit to $0.0000 by re-baselining Live Deposit to current True Net Worth."""
+    with state_lock:
+        mode = STATE.get("mode", "PAPER")
+        if mode == "LIVE":
+            sum_eq = sum(float(p.get("current_equity_usdt", 0.0)) for p in STATE.get("spot_positions", {}).values())
+            free_cash = float(STATE.get("live_spot_usdt", 0.0))
+            new_dep = round(sum_eq + free_cash, 4)
+            STATE["live_starting_deposit"] = new_dep
+            STATE["stats"]["live_skims"] = 0
+            STATE["stats"]["live_profit_usdt"] = 0.0
+            add_log(f"🔄 Reset True Net Profit to $0.0000 (New Live Deposit Baseline: ${new_dep:.4f}).")
+        else:
+            STATE["stats"]["paper_skims"] = 0
+            STATE["stats"]["paper_profit_usdt"] = 0.0
+            add_log("🔄 Reset Demo True Net Profit to $0.0000.")
+        save_state()
+    return jsonify({"ok": True, "live_starting_deposit": STATE.get("live_starting_deposit", 20.0)})
 
 
 @app.route("/api/manual_long", methods=["POST"])
@@ -1496,7 +1488,10 @@ HTML_UI = """
       <div class="sub">Tops Up Step-Outs to Full Principal</div>
     </div>
     <div class="card kpi-card kpi-vault">
-      <div class="lbl"><span>3. 🔒 True Net Profit</span></div>
+      <div class="lbl">
+        <span>3. 🔒 True Net Profit</span>
+        <button class="btn-del" style="padding:3px 8px;font-size:0.64rem;" onclick="resetTrueNetProfit()">🔄 Reset</button>
+      </div>
       <div class="val c-neon" id="profitVault">+$0.0000</div>
       <div class="sub">Wins: <strong id="skimCount" style="color:#fff;">0</strong> | Deposit: $<span id="depLbl">20.00</span></div>
     </div>
@@ -1713,6 +1708,15 @@ HTML_UI = """
 
   async function resetProfitVault() {
     await fetch('/api/reset_profit_vault', { method: 'POST' });
+    await refresh();
+  }
+
+  async function resetTrueNetProfit() {
+    const r = await fetch('/api/reset_true_net_profit', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok && d.live_starting_deposit !== undefined) {
+      document.getElementById('cfgDeposit').value = Number(d.live_starting_deposit).toFixed(2);
+    }
     await refresh();
   }
 
