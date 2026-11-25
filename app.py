@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "vaultskimmer_v4_2_state.json"
+STATE_FILE = "vaultskimmer_v4_3_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -54,13 +54,14 @@ def floor_prec(val, prec):
 DEFAULT_STATE = {
     "mode": "PAPER",
     "slot_size_usdt": 10.0,
-    "escape_dump_pct": 3.5,         # Step 1: If coin drops -3.5%, sells into USDT to prevent -15% stuck bags
-    "reentry_bounce_pct": 1.0,      # Step 2: Tracks bottom; on +1.0% bounce, tops up from Reserve -> Full $10 Re-Buy!
-    "recovery_pump_pct": 2.20,      # Step 3: Waits for +2.20% net recovery pump -> Refunds Reserve + Locks Excess!
-    "skim_profit_pct": 1.00,        # Normal Spot Skim Target (+1.00% net / +1.40% pump with 0.40% Spot fee)
-    "trail_pullback_pct": 0.22,     # Trailing Peak Rider: sells if price pulls back -0.22% off peak
-    "spot_fee_buffer_pct": 0.40,    # Gate.io Spot round-trip taker fee (0.20% buy + 0.20% sell)
-    "live_starting_deposit": 20.00, # Anchors True Net Profit to your real Gate.io Spot deposit
+    "escape_dump_pct": 4.0,         # Dump Shield: exits into USDT on -4.0% drop
+    "reentry_bounce_pct": 1.8,      # Waits for +1.8% bottom bounce (plus 20m cooldown & RSI > 35)
+    "recovery_pump_pct": 1.60,      # Faster +1.60% net recovery target to clear debt quickly
+    "skim_profit_pct": 1.00,        # Normal Spot Skim Target (+1.00% net / +1.40% pump)
+    "trail_pullback_pct": 0.22,     # Trailing Peak Rider pullback floor
+    "spot_fee_buffer_pct": 0.40,    # Gate.io Spot round-trip fee (0.20% buy + 0.20% sell)
+    "max_debt_per_coin": 0.50,      # Debt Cap: max $0.50 borrowed from Reserve per coin
+    "cooldown_minutes": 20,         # 20-minute lock after Dump Shield triggers
     "api_key": os.environ.get("GATE_API_KEY", "").strip(),
     "api_secret": os.environ.get("GATE_API_SECRET", "").strip(),
     "api_connected": False,
@@ -109,16 +110,18 @@ def load_state():
                     STATE["api_key"] = sk
                 if ss:
                     STATE["api_secret"] = ss
-                STATE.setdefault("escape_dump_pct", 3.5)
-                STATE.setdefault("reentry_bounce_pct", 1.0)
-                STATE.setdefault("recovery_pump_pct", 2.20)
+                STATE.setdefault("escape_dump_pct", 4.0)
+                STATE.setdefault("reentry_bounce_pct", 1.8)
+                STATE.setdefault("recovery_pump_pct", 1.60)
                 STATE.setdefault("skim_profit_pct", 1.00)
-                STATE.setdefault("live_starting_deposit", 20.00)
+                STATE.setdefault("max_debt_per_coin", 0.50)
+                STATE.setdefault("cooldown_minutes", 20)
                 for p in STATE.get("spot_positions", {}).values():
                     p.setdefault("phase", "ACTIVE_LONG")
                     p.setdefault("in_recovery", False)
                     p.setdefault("borrowed_from_reserve_usdt", 0.0)
                     p.setdefault("bottom_watch_price", float(p.get("last_price", 0.0)))
+                    p.setdefault("cooldown_until", 0.0)
         except Exception as e:
             add_log(f"State load notice: {e}")
 
@@ -212,7 +215,6 @@ def fetch_spot_usdt_balance(custom_key=None, custom_secret=None):
 
 
 def place_spot_market_buy(pair, usdt_amount):
-    """Gate.io v4 Spot Market Buy: amount is in QUOTE currency (USDT)."""
     url = f"{GATE_PREFIX}/spot/orders"
     body = {
         "currency_pair": pair,
@@ -229,7 +231,6 @@ def place_spot_market_buy(pair, usdt_amount):
 
 
 def place_spot_market_sell(pair, coin_qty):
-    """Gate.io v4 Spot Market Sell: amount is in BASE currency (coin quantity)."""
     meta = get_pair_meta(pair)
     prec = meta["amount_precision"]
     base_coin = pair.split("_")[0]
@@ -337,15 +338,6 @@ def compute_bull_score(pair, tk):
     s_bounce = (15.0 if lower_wick else 6.0) + (12.0 if tk["change_24h"] > 0 else 5.0)
     bull_score = int(round(max(1.0, min(99.0, s_rsi + s_ob + s_bounce))))
 
-    if bull_score >= 74:
-        sig = "SNIPE BULL BOUNCE"
-    elif bull_score >= 66:
-        sig = "BULLISH DEMAND"
-    elif rsi_14 > 72:
-        sig = "OVERBOUGHT — WAIT"
-    else:
-        sig = "NEUTRAL"
-
     res = {
         "pair": pair,
         "price": price,
@@ -353,13 +345,20 @@ def compute_bull_score(pair, tk):
         "bull_score": bull_score,
         "rsi_14": round(rsi_14, 1),
         "bid_buy_pct": round(bid_buy_pct, 1),
-        "signal": sig,
         "ts": now
     }
     BULL_RADAR_CACHE[pair] = res
     return res
 
 
+# =============================================================================
+# MAIN EXECUTION ENGINE — VAULTSKIMMER v4.3 PRO
+# 1) Verified Realized Profit Vault (zero fake cash from deposits!)
+# 2) 20-Minute Post-Shield Cooldown + 5m RSI > 35 Re-Entry Filter
+# 3) Debt Cap ($0.50 max/coin): trades remaining cash if capped; auto-restores
+#    back to full original base_slot_usdt once debt is cleared!
+# 4) Team Debt-Clearing: 50% of debt-free wins pay down highest-debt coin.
+# =============================================================================
 def run_bull_cycle(force_manual=False):
     if not cycle_lock.acquire(blocking=force_manual):
         return
@@ -368,12 +367,14 @@ def run_bull_cycle(force_manual=False):
     try:
         with state_lock:
             mode = STATE.get("mode", "PAPER")
-            escape_dump_pct = float(STATE.get("escape_dump_pct", 3.5))
-            reentry_bounce_pct = float(STATE.get("reentry_bounce_pct", 1.0))
-            recovery_pump_pct = float(STATE.get("recovery_pump_pct", 2.20))
+            escape_dump_pct = float(STATE.get("escape_dump_pct", 4.0))
+            reentry_bounce_pct = float(STATE.get("reentry_bounce_pct", 1.8))
+            recovery_pump_pct = float(STATE.get("recovery_pump_pct", 1.60))
             skim_pct = float(STATE.get("skim_profit_pct", 1.00))
             trail_pullback = float(STATE.get("trail_pullback_pct", 0.22))
             fee_buf = float(STATE.get("spot_fee_buffer_pct", 0.40))
+            max_debt_cap = float(STATE.get("max_debt_per_coin", 0.50))
+            cooldown_mins = float(STATE.get("cooldown_minutes", 20))
             has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
             active_pairs = list(STATE["spot_positions"].keys())
 
@@ -396,11 +397,17 @@ def run_bull_cycle(force_manual=False):
             return
 
         radar_list = []
-        for pair in BULL_UNIVERSE:
+        rsi_lookup = {}
+        for pair in all_pairs:
             tk = tk_map.get(pair)
             if tk:
-                radar_list.append(compute_bull_score(pair, tk))
+                score_obj = compute_bull_score(pair, tk)
+                rsi_lookup[pair] = score_obj["rsi_14"]
+                if pair in BULL_UNIVERSE:
+                    radar_list.append(score_obj)
         radar_list.sort(key=lambda x: x["bull_score"], reverse=True)
+
+        now_ts = time.time()
 
         for pair in list(STATE["spot_positions"].keys()):
             with state_lock:
@@ -413,7 +420,11 @@ def run_bull_cycle(force_manual=False):
             phase = pos.get("phase", "ACTIVE_LONG")
             margin_usdt = float(pos["margin_usdt"])
             base_slot = float(pos.get("base_slot_usdt") or 10.0)
+            current_debt = float(pos.get("borrowed_from_reserve_usdt", 0.0))
 
+            # =================================================================
+            # PHASE 2: STEPPED_OUT_HOLD (Cooldown + RSI > 35 + Debt Cap)
+            # =================================================================
             if phase == "STEPPED_OUT_HOLD":
                 bottom_px = float(pos.get("bottom_watch_price") or live_px)
                 if live_px < bottom_px:
@@ -428,16 +439,28 @@ def run_bull_cycle(force_manual=False):
                 pos["pnl_pct"] = 0.0
                 pos["pnl_usdt"] = 0.0
 
+                # Debt Cap calculation: only borrow up to remaining cap room
+                debt_room = max(0.0, round(max_debt_cap - current_debt, 4))
                 shortfall_needed = max(0.0, round(base_slot - margin_usdt, 4))
+                allowed_borrow = min(shortfall_needed, debt_room)
 
-                if live_px >= reentry_trigger_px:
+                cd_until = float(pos.get("cooldown_until", 0.0))
+                cd_left_sec = max(0.0, cd_until - now_ts)
+                coin_rsi = float(rsi_lookup.get(pair, 50.0))
+
+                if cd_left_sec > 0:
+                    mins_left = int(math.ceil(cd_left_sec / 60.0))
+                    pos["status"] = f"⏳ Cooldown: {mins_left}m left | Bottom: {fmt_px(bottom_px)} | Safe in ${margin_usdt:.2f} USDT"
+                    continue
+
+                if live_px >= reentry_trigger_px and coin_rsi >= 35.0:
                     rec_req_pump = recovery_pump_pct + fee_buf
                     new_target_px = live_px * (1.0 + (rec_req_pump / 100.0))
 
                     if mode == "PAPER":
                         with state_lock:
                             avail_res = float(STATE.get("paper_usdt_balance", 0.0))
-                            patch_from_res = min(avail_res, shortfall_needed)
+                            patch_from_res = min(avail_res, allowed_borrow)
                             restored_margin = round(margin_usdt + patch_from_res, 4)
                             STATE["paper_usdt_balance"] = round(avail_res - patch_from_res, 4)
 
@@ -446,25 +469,24 @@ def run_bull_cycle(force_manual=False):
                             pos["margin_usdt"] = restored_margin
                             pos["coin_qty"] = restored_margin / live_px
                             pos["current_equity_usdt"] = restored_margin
-                            pos["borrowed_from_reserve_usdt"] = round(
-                                float(pos.get("borrowed_from_reserve_usdt", 0.0)) + patch_from_res, 4
-                            )
+                            pos["borrowed_from_reserve_usdt"] = round(current_debt + patch_from_res, 4)
                             pos["entry_price"] = live_px
                             pos["target_sell_price"] = new_target_px
                             pos["escape_stop_price"] = live_px * (1.0 - (escape_dump_pct / 100.0))
                             pos["trailing_active"] = False
                             pos["highest_price"] = live_px
+                            cap_note = " (Debt Capped)" if patch_from_res < shortfall_needed else ""
                             pos["status"] = (
-                                f"🎯 Restored to ${restored_margin:.2f} (+${patch_from_res:.2f} from Reserve) @ {fmt_px(live_px)} | "
+                                f"🎯 Re-Bought ${restored_margin:.2f}{cap_note} @ {fmt_px(live_px)} | "
                                 f"Target +{rec_req_pump:.2f}% ({fmt_px(new_target_px)})"
                             )
                             add_log(
-                                f"🎯 [FULL ${restored_margin:.2f} RE-BUY][{pair}] Bounced +{bounce_from_bottom_pct:.2f}% off bottom! "
-                                f"Topped up +${patch_from_res:.2f} (Total Debt: ${pos['borrowed_from_reserve_usdt']:.2f}) @ {fmt_px(live_px)}"
+                                f"🎯 [RE-BUY ${restored_margin:.2f}][{pair}] Bounced +{bounce_from_bottom_pct:.2f}% (RSI {coin_rsi}) | "
+                                f"Borrowed +${patch_from_res:.2f}{cap_note} (Debt: ${pos['borrowed_from_reserve_usdt']:.2f})"
                             )
                     elif mode == "LIVE" and has_keys:
                         avail_spot = float(STATE.get("live_spot_usdt", 0.0))
-                        patch_from_res = min(avail_spot, shortfall_needed)
+                        patch_from_res = min(avail_spot, allowed_borrow)
                         buy_usdt = round(min(avail_spot, margin_usdt + patch_from_res), 2)
                         if buy_usdt >= 1.0:
                             code, resp = place_spot_market_buy(pair, buy_usdt)
@@ -481,30 +503,32 @@ def run_bull_cycle(force_manual=False):
                                     pos["coin_qty"] = filled_qty
                                     pos["margin_usdt"] = buy_usdt
                                     pos["current_equity_usdt"] = buy_usdt
-                                    pos["borrowed_from_reserve_usdt"] = round(
-                                        float(pos.get("borrowed_from_reserve_usdt", 0.0)) + patch_from_res, 4
-                                    )
+                                    pos["borrowed_from_reserve_usdt"] = round(current_debt + patch_from_res, 4)
                                     pos["entry_price"] = avg_px
                                     pos["target_sell_price"] = new_target_px
                                     pos["escape_stop_price"] = avg_px * (1.0 - (escape_dump_pct / 100.0))
                                     pos["trailing_active"] = False
                                     pos["highest_price"] = avg_px
-                                    pos["status"] = f"🎯 Live Re-Bought (${buy_usdt:.2f}) @ {fmt_px(avg_px)} | Target +{rec_req_pump:.2f}%"
+                                    cap_note = " (Debt Capped)" if patch_from_res < shortfall_needed else ""
+                                    pos["status"] = f"🎯 Live Re-Bought ${buy_usdt:.2f}{cap_note} @ {fmt_px(avg_px)}"
                                     add_log(
-                                        f"🎯 [LIVE SPOT RE-BUY][{pair}] Bounced +{bounce_from_bottom_pct:.2f}% off bottom -> "
-                                        f"Bought ${buy_usdt:.2f} @ {fmt_px(avg_px)} (Debt: ${pos['borrowed_from_reserve_usdt']:.2f})"
+                                        f"🎯 [LIVE RE-BUY][{pair}] Bought ${buy_usdt:.2f}{cap_note} @ {fmt_px(avg_px)} "
+                                        f"(RSI {coin_rsi} | Debt: ${pos['borrowed_from_reserve_usdt']:.2f})"
                                     )
                 else:
                     need_bounce = max(0.0, reentry_bounce_pct - bounce_from_bottom_pct)
+                    rsi_tag = f"RSI {coin_rsi:.0f} (need >35)" if coin_rsi < 35.0 else f"RSI {coin_rsi:.0f} OK"
                     pos["status"] = (
-                        f"🛡️ Holding ${margin_usdt:.2f} USDT (Adds +${shortfall_needed:.2f} -> ${base_slot:.2f}) | "
-                        f"Bottom: {fmt_px(bottom_px)} | Re-Buys on +{need_bounce:.2f}% bounce @ {fmt_px(reentry_trigger_px)}"
+                        f"🛡️ Safe ${margin_usdt:.2f} USDT | {rsi_tag} | "
+                        f"Re-Buys on +{need_bounce:.2f}% bounce @ {fmt_px(reentry_trigger_px)}"
                     )
                 continue
 
+            # =================================================================
+            # PHASE 1: ACTIVE_LONG (Pump Skim OR Dump Escape Shield)
+            # =================================================================
             entry_px = float(pos["entry_price"])
-            borrowed_now = float(pos.get("borrowed_from_reserve_usdt", 0.0))
-            in_rec = bool(pos.get("in_recovery", False)) or (borrowed_now > 0.01)
+            in_rec = bool(pos.get("in_recovery", False)) or (current_debt > 0.01) or (margin_usdt < base_slot - 0.05)
             pos["in_recovery"] = in_rec
 
             active_skim_goal_pct = recovery_pump_pct if in_rec else skim_pct
@@ -524,10 +548,11 @@ def run_bull_cycle(force_manual=False):
             pos["pnl_usdt"] = round(net_pnl_usdt, 4)
             pos["current_equity_usdt"] = round(margin_usdt + net_pnl_usdt, 4)
 
+            # 1) DUMP ESCAPE SHIELD + 20-MIN COOLDOWN
             if coin_move_pct <= -escape_dump_pct:
                 held_cash = round(margin_usdt * (1.0 - ((escape_dump_pct + (fee_buf / 2.0)) / 100.0)), 4)
                 reentry_px = live_px * (1.0 + (reentry_bounce_pct / 100.0))
-                shortfall = max(0.0, round(base_slot - held_cash, 4))
+                cd_target = now_ts + (cooldown_mins * 60.0)
 
                 if mode == "PAPER":
                     with state_lock:
@@ -536,16 +561,14 @@ def run_bull_cycle(force_manual=False):
                         pos["current_equity_usdt"] = held_cash
                         pos["bottom_watch_price"] = live_px
                         pos["reentry_trigger_price"] = reentry_px
+                        pos["cooldown_until"] = cd_target
                         pos["step_outs_count"] = int(pos.get("step_outs_count", 0)) + 1
                         pos["pnl_pct"] = 0.0
                         pos["pnl_usdt"] = 0.0
-                        pos["status"] = (
-                            f"🛡️ Stepped Out @ {fmt_px(live_px)} (${held_cash:.2f} held) | "
-                            f"Waits for +{reentry_bounce_pct}% bounce, adds +${shortfall:.2f} -> ${base_slot:.2f}"
-                        )
+                        pos["status"] = f"⏳ Cooldown {int(cooldown_mins)}m | Stepped Out @ {fmt_px(live_px)} (${held_cash:.2f} safe)"
                         add_log(
-                            f"🛡️ [-{escape_dump_pct}% DUMP SHIELD][{pair}] Dropped {coin_move_pct:.2f}% to {fmt_px(live_px)}! "
-                            f"Sold into USDT (${held_cash:.2f}) — Waiting for +{reentry_bounce_pct}% bottom bounce."
+                            f"🛡️ [-{escape_dump_pct}% DUMP SHIELD][{pair}] Sold @ {fmt_px(live_px)} (${held_cash:.2f} safe) — "
+                            f"{int(cooldown_mins)}m Cooldown started."
                         )
                     continue
                 elif mode == "LIVE" and has_keys:
@@ -560,15 +583,18 @@ def run_bull_cycle(force_manual=False):
                             pos["current_equity_usdt"] = round(real_usdt, 4)
                             pos["bottom_watch_price"] = live_px
                             pos["reentry_trigger_price"] = reentry_px
+                            pos["cooldown_until"] = cd_target
                             pos["step_outs_count"] = int(pos.get("step_outs_count", 0)) + 1
                             pos["pnl_pct"] = 0.0
                             pos["pnl_usdt"] = 0.0
-                            pos["status"] = f"🛡️ Live Stepped Out @ {fmt_px(live_px)} | Re-Buys full ${base_slot:.2f} on +{reentry_bounce_pct}% bounce"
+                            pos["status"] = f"⏳ Cooldown {int(cooldown_mins)}m | Live Stepped Out @ {fmt_px(live_px)}"
                             add_log(
-                                f"🛡️ [LIVE -{escape_dump_pct}% DUMP SHIELD][{pair}] Sold Spot @ {fmt_px(live_px)} (${real_usdt:.2f} USDT safe)!"
+                                f"🛡️ [LIVE DUMP SHIELD][{pair}] Sold Spot @ {fmt_px(live_px)} (${real_usdt:.2f} safe) — "
+                                f"{int(cooldown_mins)}m Cooldown started."
                             )
                         continue
 
+            # 2) PUMP TARGET CHECK
             should_skim_and_rebuy = False
             if live_px >= target_sell_px:
                 if not pos.get("trailing_active"):
@@ -590,25 +616,54 @@ def run_bull_cycle(force_manual=False):
                 else:
                     pos["trailing_active"] = False
                     need_pump = max(0.0, ((target_sell_px - live_px) / live_px) * 100.0)
-                    mode_tag = f"+{recovery_pump_pct}% Recovery (Debt: ${borrowed_now:.2f})" if in_rec else f"+{skim_pct}% Skim"
-                    pos["status"] = (
-                        f"Need +{need_pump:.2f}% pump for {mode_tag} | "
-                        f"-{escape_dump_pct}% Shield @ {fmt_px(escape_stop_px)}"
-                    )
+                    mode_tag = f"+{recovery_pump_pct}% Recovery (Debt: ${current_debt:.2f})" if in_rec else f"+{skim_pct}% Skim"
+                    pos["status"] = f"Need +{need_pump:.2f}% pump for {mode_tag} | -{escape_dump_pct}% Shield @ {fmt_px(escape_stop_px)}"
 
+            # 3) EXECUTE SKIM + AUTO-RESTORE TO ORIGINAL PRINCIPAL + TEAM DEBT-CLEARING
             if should_skim_and_rebuy:
                 gross_gain_usdt = max(0.02, round(margin_usdt * (max(active_skim_goal_pct, net_pnl_pct) / 100.0), 4))
                 borrowed_res = float(pos.get("borrowed_from_reserve_usdt", 0.0))
 
+                # Step A: Pay own Reserve debt first
                 if borrowed_res > 0.0:
                     reserve_refund = round(min(gross_gain_usdt, borrowed_res), 4)
                     remaining_debt = max(0.0, round(borrowed_res - reserve_refund, 4))
-                    pure_vault_profit = max(0.0, round(gross_gain_usdt - reserve_refund, 4))
+                    leftover_gain = max(0.0, round(gross_gain_usdt - reserve_refund, 4))
                 else:
                     reserve_refund = 0.0
                     remaining_debt = 0.0
-                    pure_vault_profit = gross_gain_usdt
+                    leftover_gain = gross_gain_usdt
 
+                # Step B: If this coin was running below its original base_slot (e.g. $9.65),
+                # restore it back to full original base_slot ($10.00) once debt is cleared!
+                next_buy_size = margin_usdt
+                restored_principal_msg = ""
+                if remaining_debt <= 0.01:
+                    next_buy_size = base_slot
+                    if margin_usdt < base_slot - 0.05:
+                        restored_principal_msg = f" | Restored to Full ${base_slot:.2f}!"
+
+                # Step C: Team Debt-Clearing (50% of debt-free leftover profit helps highest-debt teammate)
+                team_help = 0.0
+                helped_pair = None
+                if remaining_debt <= 0.01 and leftover_gain >= 0.02:
+                    with state_lock:
+                        debtors = [
+                            (k, float(v.get("borrowed_from_reserve_usdt", 0.0)))
+                            for k, v in STATE["spot_positions"].items()
+                            if k != pair and float(v.get("borrowed_from_reserve_usdt", 0.0)) > 0.01
+                        ]
+                        if debtors:
+                            debtors.sort(key=lambda x: x[1], reverse=True)
+                            helped_pair, top_debt = debtors[0]
+                            team_help = round(min(leftover_gain * 0.50, top_debt), 4)
+                            STATE["spot_positions"][helped_pair]["borrowed_from_reserve_usdt"] = max(
+                                0.0, round(top_debt - team_help, 4)
+                            )
+                            if STATE["spot_positions"][helped_pair]["borrowed_from_reserve_usdt"] <= 0.01:
+                                STATE["spot_positions"][helped_pair]["in_recovery"] = False
+
+                pure_vault_profit = max(0.0, round(leftover_gain - team_help, 4))
                 still_in_recovery = remaining_debt > 0.01
                 next_goal = recovery_pump_pct if still_in_recovery else skim_pct
                 new_target_px = live_px * (1.0 + ((next_goal + fee_buf) / 100.0))
@@ -617,10 +672,11 @@ def run_bull_cycle(force_manual=False):
                     with state_lock:
                         if pair not in STATE["spot_positions"]:
                             continue
-                        if reserve_refund > 0:
-                            STATE["paper_usdt_balance"] = round(
-                                STATE.get("paper_usdt_balance", 0.0) + reserve_refund, 4
-                            )
+                        # Adjust Reserve for refunds + restoring principal if needed
+                        principal_delta = max(0.0, round(next_buy_size - margin_usdt, 4))
+                        STATE["paper_usdt_balance"] = round(
+                            STATE.get("paper_usdt_balance", 0.0) + reserve_refund + team_help - principal_delta, 4
+                        )
                         STATE["stats"]["paper_skims"] += 1
                         STATE["stats"]["paper_profit_usdt"] = round(
                             STATE["stats"]["paper_profit_usdt"] + pure_vault_profit, 4
@@ -636,33 +692,34 @@ def run_bull_cycle(force_manual=False):
                             "buy_to_sell": f"{fmt_px(entry_px)} → {fmt_px(live_px)}",
                             "profit": profit_tag
                         })
+                        help_note = f" | Team Help -> {helped_pair} (-${team_help:.2f} debt)" if team_help > 0 else ""
                         add_log(
-                            f"🔒💎 [BULL SKIM WON][{pair}] Pumped +{coin_move_pct:.2f}% | "
-                            f"Reserve Refund: +${reserve_refund:.2f} (Debt Left: ${remaining_debt:.2f}) | "
-                            f"Net Vault Profit: +${pure_vault_profit:.4f}"
+                            f"🔒💎 [BULL SKIM][{pair}] +{coin_move_pct:.2f}% | Refund: +${reserve_refund:.2f} | "
+                            f"Vault: +${pure_vault_profit:.4f}{help_note}{restored_principal_msg}"
                         )
 
                         pos["phase"] = "ACTIVE_LONG"
                         pos["in_recovery"] = still_in_recovery
                         pos["borrowed_from_reserve_usdt"] = remaining_debt
-                        pos["margin_usdt"] = base_slot
-                        pos["coin_qty"] = base_slot / live_px
-                        pos["current_equity_usdt"] = base_slot
+                        pos["margin_usdt"] = next_buy_size
+                        pos["coin_qty"] = next_buy_size / live_px
+                        pos["current_equity_usdt"] = next_buy_size
                         pos["entry_price"] = live_px
                         pos["target_sell_price"] = new_target_px
                         pos["escape_stop_price"] = live_px * (1.0 - (escape_dump_pct / 100.0))
                         pos["coin_move_pct"] = 0.0
                         pos["pnl_pct"] = -fee_buf
-                        pos["pnl_usdt"] = round(-base_slot * (fee_buf / 100.0), 4)
+                        pos["pnl_usdt"] = round(-next_buy_size * (fee_buf / 100.0), 4)
                         pos["trailing_active"] = False
                         pos["highest_price"] = live_px
-                        pos["status"] = f"Cycle #{pos['slot_skims']} Done — Re-Bought ${base_slot:.2f} @ {fmt_px(live_px)}"
+                        pos["status"] = f"Cycle #{pos['slot_skims']} Done — Re-Bought ${next_buy_size:.2f} @ {fmt_px(live_px)}"
 
                 elif mode == "LIVE" and has_keys:
                     code_s, resp_s = place_spot_market_sell(pair, float(pos.get("coin_qty", 0.0)))
                     if code_s in (200, 201):
-                        code_b, resp_b = place_spot_market_buy(pair, base_slot)
-                        new_qty = float(resp_b.get("filled_amount") or (base_slot / live_px)) if code_b in (200, 201) else 0.0
+                        buy_amt = round(next_buy_size, 2)
+                        code_b, resp_b = place_spot_market_buy(pair, buy_amt)
+                        new_qty = float(resp_b.get("filled_amount") or (buy_amt / live_px)) if code_b in (200, 201) else 0.0
                         new_entry = float(resp_b.get("avg_deal_price") or live_px) if code_b in (200, 201) else live_px
                         if new_entry <= 0:
                             new_entry = live_px
@@ -686,16 +743,17 @@ def run_bull_cycle(force_manual=False):
                             pos["in_recovery"] = still_in_recovery
                             pos["borrowed_from_reserve_usdt"] = remaining_debt
                             pos["coin_qty"] = new_qty
-                            pos["margin_usdt"] = base_slot
-                            pos["current_equity_usdt"] = base_slot
+                            pos["margin_usdt"] = buy_amt
+                            pos["current_equity_usdt"] = buy_amt
                             pos["entry_price"] = new_entry
                             pos["target_sell_price"] = new_target_px
                             pos["escape_stop_price"] = new_entry * (1.0 - (escape_dump_pct / 100.0))
                             pos["trailing_active"] = False
                             pos["highest_price"] = new_entry
+                            help_note = f" | Team Help -> {helped_pair} (-${team_help:.2f})" if team_help > 0 else ""
                             add_log(
-                                f"🔒💎 [LIVE SPOT SKIM][{pair}] Refunded ${reserve_refund:.2f} (Debt: ${remaining_debt:.2f}) | "
-                                f"Net Vault Profit: +${pure_vault_profit:.4f} | Re-Bought ${base_slot:.2f} @ {fmt_px(new_entry)}"
+                                f"🔒💎 [LIVE SKIM][{pair}] Refund: ${reserve_refund:.2f} | Vault: +${pure_vault_profit:.4f}"
+                                f"{help_note}{restored_principal_msg}"
                             )
 
         with state_lock:
@@ -713,7 +771,7 @@ def run_bull_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("🟢 VaultSkimmer v4.2 PRO Online — Bullish Spot Skimmer + Carry-Over Recovery + -3.5% Dump Shield.")
+    add_log("🟢 VaultSkimmer v4.3 PRO Online — Verified Profit Vault + Debt Cap + Cooldown + Team Debt-Clearing.")
     while True:
         run_bull_cycle(force_manual=False)
         time.sleep(3.5)
@@ -734,12 +792,12 @@ def check_worker():
 
 
 # =============================================================================
-# PWA MOBILE INSTALLER ENDPOINTS (GREEN BULLISH ICON)
+# PWA MOBILE INSTALLER ENDPOINTS
 # =============================================================================
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
-        "name": "VaultSkimmer v4.2 PRO",
+        "name": "VaultSkimmer v4.3 PRO",
         "short_name": "VaultSkimmer",
         "start_url": "/",
         "display": "standalone",
@@ -807,7 +865,7 @@ def api_sync_live_positions():
         with state_lock:
             fee_buf = float(STATE.get("spot_fee_buffer_pct", 0.40))
             req_pump = float(STATE.get("skim_profit_pct", 1.0)) + fee_buf
-            esc_pct = float(STATE.get("escape_dump_pct", 3.5))
+            esc_pct = float(STATE.get("escape_dump_pct", 4.0))
             for cur, qty in bals.items():
                 if cur in ("USDT", "USD", "GT"):
                     continue
@@ -824,6 +882,7 @@ def api_sync_live_positions():
                     "phase": "ACTIVE_LONG",
                     "in_recovery": False,
                     "borrowed_from_reserve_usdt": 0.0,
+                    "cooldown_until": 0.0,
                     "coin_qty": qty,
                     "base_slot_usdt": val,
                     "margin_usdt": val,
@@ -897,35 +956,17 @@ def api_close_all_active_coins():
 @app.route("/api/reset_profit_vault", methods=["POST"])
 def api_reset_profit_vault():
     with state_lock:
-        STATE["stats"]["paper_skims"] = 0
-        STATE["stats"]["paper_profit_usdt"] = 0.0
-        STATE["stats"]["live_skims"] = 0
-        STATE["stats"]["live_profit_usdt"] = 0.0
-        STATE["skim_ledger"] = []
-        add_log("🧹 Reset Locked Profit Vault & Skim Ledger to $0.0000.")
-        save_state()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/reset_true_net_profit", methods=["POST"])
-def api_reset_true_net_profit():
-    """Resets True Net Profit to $0.0000 by re-baselining Live Deposit to current True Net Worth."""
-    with state_lock:
         mode = STATE.get("mode", "PAPER")
         if mode == "LIVE":
-            sum_eq = sum(float(p.get("current_equity_usdt", 0.0)) for p in STATE.get("spot_positions", {}).values())
-            free_cash = float(STATE.get("live_spot_usdt", 0.0))
-            new_dep = round(sum_eq + free_cash, 4)
-            STATE["live_starting_deposit"] = new_dep
             STATE["stats"]["live_skims"] = 0
             STATE["stats"]["live_profit_usdt"] = 0.0
-            add_log(f"🔄 Reset True Net Profit to $0.0000 (New Live Deposit Baseline: ${new_dep:.4f}).")
         else:
             STATE["stats"]["paper_skims"] = 0
             STATE["stats"]["paper_profit_usdt"] = 0.0
-            add_log("🔄 Reset Demo True Net Profit to $0.0000.")
+        STATE["skim_ledger"] = []
+        add_log(f"🔄 Reset {mode} Verified Profit Vault & Ledger to $0.0000.")
         save_state()
-    return jsonify({"ok": True, "live_starting_deposit": STATE.get("live_starting_deposit", 20.0)})
+    return jsonify({"ok": True})
 
 
 @app.route("/api/manual_long", methods=["POST"])
@@ -951,7 +992,7 @@ def api_manual_long():
         c_price = tk_map[pair]["last"]
         fee_buf = float(STATE.get("spot_fee_buffer_pct", 0.40))
         req_pump = float(STATE.get("skim_profit_pct", 1.0)) + fee_buf
-        esc_pct = float(STATE.get("escape_dump_pct", 3.5))
+        esc_pct = float(STATE.get("escape_dump_pct", 4.0))
         target_px = c_price * (1.0 + (req_pump / 100.0))
         esc_px = c_price * (1.0 - (esc_pct / 100.0))
 
@@ -967,6 +1008,7 @@ def api_manual_long():
                     "phase": "ACTIVE_LONG",
                     "in_recovery": False,
                     "borrowed_from_reserve_usdt": 0.0,
+                    "cooldown_until": 0.0,
                     "coin_qty": custom_size / c_price,
                     "base_slot_usdt": custom_size,
                     "margin_usdt": custom_size,
@@ -987,10 +1029,7 @@ def api_manual_long():
                     "highest_price": c_price,
                     "status": f"Armed: Skims @ {fmt_px(target_px)} | -{esc_pct}% Shield @ {fmt_px(esc_px)}"
                 }
-                add_log(
-                    f"🚀 [DEMO SPOT BUY][{pair}] Deployed ${custom_size:.2f} @ {fmt_px(c_price)} "
-                    f"(Target: {fmt_px(target_px)} | -{esc_pct}% Shield: {fmt_px(esc_px)})"
-                )
+                add_log(f"🚀 [DEMO SPOT BUY][{pair}] Deployed ${custom_size:.2f} @ {fmt_px(c_price)}")
                 save_state()
             return jsonify({"ok": True})
         else:
@@ -998,10 +1037,7 @@ def api_manual_long():
                 return jsonify({"ok": False, "error": "Paste & Sync your Gate.io Spot API Keys first!"}), 400
             avail_spot = fetch_spot_usdt_balance()
             if avail_spot < custom_size:
-                return jsonify({
-                    "ok": False,
-                    "error": f"Insufficient Gate.io Spot USDT (Available: ${avail_spot:.2f})"
-                }), 400
+                return jsonify({"ok": False, "error": f"Insufficient Gate.io Spot USDT (Available: ${avail_spot:.2f})"}), 400
             code, resp = place_spot_market_buy(pair, custom_size)
             if code in (200, 201):
                 filled_qty = float(resp.get("filled_amount") or (custom_size / c_price))
@@ -1018,6 +1054,7 @@ def api_manual_long():
                         "phase": "ACTIVE_LONG",
                         "in_recovery": False,
                         "borrowed_from_reserve_usdt": 0.0,
+                        "cooldown_until": 0.0,
                         "coin_qty": filled_qty,
                         "base_slot_usdt": custom_size,
                         "margin_usdt": custom_size,
@@ -1036,7 +1073,7 @@ def api_manual_long():
                         "pnl_usdt": round(-custom_size * (fee_buf / 100.0), 4),
                         "trailing_active": False,
                         "highest_price": avg_px,
-                        "status": f"LIVE Spot Loop Active | -{esc_pct}% Dump Shield Armed"
+                        "status": f"LIVE Spot Loop Active | -{esc_pct}% Shield Armed"
                     }
                     add_log(f"🚀 [LIVE SPOT BUY][{pair}] Bought ${custom_size:.2f} @ {fmt_px(avg_px)}")
                     save_state()
@@ -1058,9 +1095,11 @@ def api_step_out_or_resnipe_now():
         live_px = float(pos["last_price"])
         base_slot = float(pos.get("base_slot_usdt", 10.0))
         margin_usdt = float(pos.get("margin_usdt", 10.0))
-        reentry_bounce = float(STATE.get("reentry_bounce_pct", 1.0))
-        rec_pump = float(STATE.get("recovery_pump_pct", 2.20))
-        esc_pct = float(STATE.get("escape_dump_pct", 3.5))
+        current_debt = float(pos.get("borrowed_from_reserve_usdt", 0.0))
+        max_debt_cap = float(STATE.get("max_debt_per_coin", 0.50))
+        reentry_bounce = float(STATE.get("reentry_bounce_pct", 1.8))
+        rec_pump = float(STATE.get("recovery_pump_pct", 1.60))
+        esc_pct = float(STATE.get("escape_dump_pct", 4.0))
         fee_buf = float(STATE.get("spot_fee_buffer_pct", 0.40))
 
     if phase == "ACTIVE_LONG":
@@ -1077,21 +1116,24 @@ def api_step_out_or_resnipe_now():
             pos["current_equity_usdt"] = round(real_eq, 4)
             pos["bottom_watch_price"] = live_px
             pos["reentry_trigger_price"] = re_px
+            pos["cooldown_until"] = 0.0
             pos["step_outs_count"] = int(pos.get("step_outs_count", 0)) + 1
             pos["pnl_pct"] = 0.0
             pos["pnl_usdt"] = 0.0
-            pos["status"] = f"🛡️ Stepped Out @ {fmt_px(live_px)} (${real_eq:.2f}) | Re-Buys full ${base_slot:.2f} on +{reentry_bounce}% bounce"
-            add_log(f"🛡️ [MANUAL STEP-OUT][{pair}] Sold Spot @ {fmt_px(live_px)} (${real_eq:.2f} USDT held) -> Watching bottom!")
+            pos["status"] = f"🛡️ Manual Step-Out @ {fmt_px(live_px)} (${real_eq:.2f} safe)"
+            add_log(f"🛡️ [MANUAL STEP-OUT][{pair}] Sold Spot @ {fmt_px(live_px)} (${real_eq:.2f} USDT held).")
             save_state()
         return jsonify({"ok": True})
     else:
         req_pump = rec_pump + fee_buf
         new_target = live_px * (1.0 + (req_pump / 100.0))
+        debt_room = max(0.0, round(max_debt_cap - current_debt, 4))
         shortfall = max(0.0, round(base_slot - margin_usdt, 4))
+        allowed_borrow = min(shortfall, debt_room)
 
         if mode == "LIVE" and pos.get("is_live") and STATE.get("api_key"):
             avail_spot = float(STATE.get("live_spot_usdt", 0.0))
-            patch = min(avail_spot, shortfall)
+            patch = min(avail_spot, allowed_borrow)
             buy_usdt = round(min(avail_spot, margin_usdt + patch), 2)
             code, resp = place_spot_market_buy(pair, buy_usdt)
             if code not in (200, 201):
@@ -1106,30 +1148,29 @@ def api_step_out_or_resnipe_now():
                 pos["margin_usdt"] = buy_usdt
                 pos["current_equity_usdt"] = buy_usdt
                 pos["entry_price"] = avg_px
-                pos["borrowed_from_reserve_usdt"] = round(float(pos.get("borrowed_from_reserve_usdt", 0.0)) + patch, 4)
+                pos["borrowed_from_reserve_usdt"] = round(current_debt + patch, 4)
         else:
             with state_lock:
                 avail_res = float(STATE.get("paper_usdt_balance", 0.0))
-                patch = min(avail_res, shortfall)
+                patch = min(avail_res, allowed_borrow)
                 restored_margin = round(margin_usdt + patch, 4)
                 STATE["paper_usdt_balance"] = round(avail_res - patch, 4)
                 pos["coin_qty"] = restored_margin / live_px
                 pos["margin_usdt"] = restored_margin
                 pos["current_equity_usdt"] = restored_margin
                 pos["entry_price"] = live_px
-                pos["borrowed_from_reserve_usdt"] = round(float(pos.get("borrowed_from_reserve_usdt", 0.0)) + patch, 4)
+                pos["borrowed_from_reserve_usdt"] = round(current_debt + patch, 4)
 
         with state_lock:
             pos["phase"] = "ACTIVE_LONG"
             pos["in_recovery"] = True
+            pos["cooldown_until"] = 0.0
             pos["target_sell_price"] = new_target
             pos["escape_stop_price"] = pos["entry_price"] * (1.0 - (esc_pct / 100.0))
             pos["trailing_active"] = False
             pos["highest_price"] = pos["entry_price"]
-            pos["status"] = f"🎯 Restored to ${pos['margin_usdt']:.2f} @ {fmt_px(pos['entry_price'])} | Target +{req_pump:.2f}%"
-            add_log(
-                f"🎯 [MANUAL FULL RE-BUY][{pair}] Topped up to ${pos['margin_usdt']:.2f} from Reserve @ {fmt_px(pos['entry_price'])}"
-            )
+            pos["status"] = f"🎯 Manual Re-Buy ${pos['margin_usdt']:.2f} @ {fmt_px(pos['entry_price'])}"
+            add_log(f"🎯 [MANUAL RE-BUY][{pair}] Re-entered with ${pos['margin_usdt']:.2f} @ {fmt_px(pos['entry_price'])}.")
             save_state()
         return jsonify({"ok": True})
 
@@ -1165,12 +1206,13 @@ def api_update_config():
             STATE["reentry_bounce_pct"] = max(0.2, float(d["reentry_bounce_pct"]))
         if d.get("recovery_pump_pct"):
             STATE["recovery_pump_pct"] = max(0.5, float(d["recovery_pump_pct"]))
-        if d.get("live_starting_deposit"):
-            STATE["live_starting_deposit"] = max(1.0, float(d["live_starting_deposit"]))
+        if d.get("max_debt_per_coin") is not None and d.get("max_debt_per_coin") != "":
+            STATE["max_debt_per_coin"] = max(0.0, float(d["max_debt_per_coin"]))
+        if d.get("cooldown_minutes") is not None and d.get("cooldown_minutes") != "":
+            STATE["cooldown_minutes"] = max(0, int(float(d["cooldown_minutes"])))
         add_log(
-            f"⚙️ Saved v4.2 Spot Settings: Dump Shield=-{STATE['escape_dump_pct']}% | "
-            f"Bounce Re-Buy=+{STATE['reentry_bounce_pct']}% | Recovery=+{STATE['recovery_pump_pct']}% | "
-            f"Skim=+{STATE['skim_profit_pct']}% | Live Deposit=${STATE['live_starting_deposit']:.2f}"
+            f"⚙️ Saved v4.3 Settings: Shield=-{STATE['escape_dump_pct']}% | Bounce=+{STATE['reentry_bounce_pct']}% | "
+            f"Rec=+{STATE['recovery_pump_pct']}% | Debt Cap=${STATE['max_debt_per_coin']:.2f} | Cooldown={STATE['cooldown_minutes']}m"
         )
         save_state()
     run_bull_cycle(force_manual=True)
@@ -1205,7 +1247,7 @@ def api_sync_keys():
 
 
 # =============================================================================
-# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — VAULTSKIMMER v4.2 PRO (BULL EDITION)
+# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — VAULTSKIMMER v4.3 PRO
 # =============================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -1219,21 +1261,21 @@ HTML_UI = """
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet" />
-  <title>VaultSkimmer v4.2 PRO | Institutional Spot Bull Terminal</title>
+  <title>VaultSkimmer v4.3 PRO | Institutional Spot Bull Terminal</title>
   <style>
     :root {
-      --bg: #040807;
-      --surface: rgba(11, 20, 18, 0.78);
+      --bg: #030706;
+      --surface: rgba(10, 20, 17, 0.82);
       --border: rgba(255, 255, 255, 0.08);
-      --border-glow: rgba(0, 245, 160, 0.35);
+      --border-glow: rgba(0, 245, 160, 0.38);
       --neon: #00f5a0;
-      --neon-soft: rgba(0, 245, 160, 0.13);
+      --neon-soft: rgba(0, 245, 160, 0.14);
       --cyan: #00d9f5;
       --crimson: #ff2a5f;
       --crimson-soft: rgba(255, 42, 95, 0.14);
       --amber: #ffb020;
       --text: #f4f8f7;
-      --muted: #8a9b96;
+      --muted: #849992;
       --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
     }
 
@@ -1242,7 +1284,7 @@ HTML_UI = """
     body {
       background-color: var(--bg);
       background-image:
-        radial-gradient(ellipse 80% 50% at 50% -10%, rgba(0, 245, 160, 0.15), transparent 65%),
+        radial-gradient(ellipse 80% 50% at 50% -10%, rgba(0, 245, 160, 0.16), transparent 65%),
         radial-gradient(ellipse 60% 40% at 90% 10%, rgba(0, 217, 245, 0.10), transparent 60%),
         linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
         linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
@@ -1261,9 +1303,8 @@ HTML_UI = """
     .wrap { max-width: 1280px; margin: 0 auto; }
 
     .hero {
-      background: linear-gradient(135deg, rgba(8, 28, 22, 0.88), rgba(9, 16, 20, 0.92));
+      background: linear-gradient(135deg, rgba(8, 30, 23, 0.90), rgba(8, 15, 18, 0.94));
       backdrop-filter: blur(20px);
-      -webkit-backdrop-filter: blur(20px);
       border: 1px solid var(--border-glow);
       border-radius: 20px;
       padding: 20px 24px;
@@ -1283,13 +1324,13 @@ HTML_UI = """
     .btn {
       cursor: pointer; border: none; border-radius: 11px; padding: 10px 15px;
       font-weight: 800; font-size: 0.76rem; letter-spacing: 0.2px;
-      transition: transform 0.12s ease, box-shadow 0.2s ease, filter 0.15s ease;
+      transition: transform 0.12s ease, filter 0.15s ease;
       display: inline-flex; align-items: center; justify-content: center; gap: 6px;
     }
     .btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
     .btn:active { transform: scale(0.97); }
     .btn-bull { background: linear-gradient(135deg, var(--neon), var(--cyan)); color: #031c15; box-shadow: 0 4px 18px rgba(0, 245, 160, 0.28); }
-    .btn-crimson { background: linear-gradient(135deg, var(--crimson), #d90429); color: #fff; box-shadow: 0 4px 18px rgba(255, 42, 95, 0.3); }
+    .btn-crimson { background: linear-gradient(135deg, var(--crimson), #d90429); color: #fff; }
     .btn-amber { background: linear-gradient(135deg, #ffb020, #f59e0b); color: #1a1200; }
     .btn-outline { background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.14); color: #e2e8f0; }
     .btn-outline:hover { border-color: var(--neon); color: #fff; background: var(--neon-soft); }
@@ -1310,11 +1351,8 @@ HTML_UI = """
     @media (max-width: 920px) { .top-panels { grid-template-columns: 1fr; } }
 
     .panel-card {
-      background: var(--surface);
-      backdrop-filter: blur(16px);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 16px 18px;
+      background: var(--surface); backdrop-filter: blur(16px);
+      border: 1px solid var(--border); border-radius: 16px; padding: 16px 18px;
       box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
     }
     .sec-title {
@@ -1327,21 +1365,16 @@ HTML_UI = """
 
     .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); gap: 14px; margin-bottom: 16px; }
     .card {
-      background: var(--surface);
-      backdrop-filter: blur(16px);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 18px 20px;
+      background: var(--surface); backdrop-filter: blur(16px);
+      border: 1px solid var(--border); border-radius: 16px; padding: 18px 20px;
       box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
-      transition: border-color 0.2s ease;
     }
-    .card:hover { border-color: rgba(255, 255, 255, 0.14); }
     .kpi-card { position: relative; overflow: hidden; }
     .kpi-card::before {
       content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
       background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
     }
-    .kpi-vault { border-color: rgba(0, 245, 160, 0.35); background: linear-gradient(180deg, rgba(0, 245, 160, 0.06), var(--surface)); }
+    .kpi-vault { border-color: rgba(0, 245, 160, 0.38); background: linear-gradient(180deg, rgba(0, 245, 160, 0.06), var(--surface)); }
     .kpi-vault::before { background: linear-gradient(90deg, transparent, var(--neon), transparent); }
     .lbl { font-size: 0.68rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
     .val { font-family: var(--mono); font-size: 1.65rem; font-weight: 800; margin: 8px 0 6px; letter-spacing: -0.5px; }
@@ -1355,13 +1388,9 @@ HTML_UI = """
 
     .pos-card {
       background: linear-gradient(180deg, rgba(16, 32, 27, 0.9), rgba(9, 17, 15, 0.95));
-      border: 1px solid rgba(255, 255, 255, 0.09);
-      border-radius: 15px;
-      padding: 15px 16px;
-      margin-bottom: 12px;
-      transition: border-color 0.2s ease;
+      border: 1px solid rgba(255, 255, 255, 0.09); border-radius: 15px; padding: 15px 16px; margin-bottom: 12px;
     }
-    .pos-card:hover { border-color: rgba(0, 245, 160, 0.35); }
+    .pos-card:hover { border-color: rgba(0, 245, 160, 0.38); }
     .step-pill { background: rgba(0, 217, 245, 0.12); border: 1px solid rgba(0, 217, 245, 0.45); color: var(--cyan); font-size: 0.67rem; font-weight: 800; padding: 3px 9px; border-radius: 99px; }
     .bull-pill { background: var(--neon-soft); border: 1px solid rgba(0, 245, 160, 0.45); color: var(--neon); font-size: 0.67rem; font-weight: 800; padding: 3px 9px; border-radius: 99px; }
 
@@ -1373,41 +1402,37 @@ HTML_UI = """
     .metrics-box strong { font-family: var(--mono); }
 
     .track { height: 7px; background: rgba(255,255,255,0.05); border-radius: 99px; overflow: hidden; margin: 8px 0; }
-    .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--neon)); border-radius: 99px; transition: width 0.4s cubic-bezier(0.22, 1, 0.36, 1); }
+    .fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--neon)); border-radius: 99px; transition: width 0.4s ease; }
 
     .btn-step {
       background: var(--neon-soft); border: 1px solid rgba(0, 245, 160, 0.45); color: var(--neon);
       padding: 7px 12px; border-radius: 9px; font-size: 0.72rem; font-weight: 800; cursor: pointer;
     }
-    .btn-step:hover { background: rgba(0, 245, 160, 0.22); }
     .btn-del {
       background: var(--crimson-soft); border: 1px solid rgba(255, 42, 95, 0.45); color: #fda4af;
       padding: 7px 12px; border-radius: 9px; font-size: 0.72rem; font-weight: 800; cursor: pointer;
     }
-    .btn-del:hover { background: rgba(255, 42, 95, 0.25); color: #fff; }
 
     .chip-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
     .chip {
       background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.1);
       color: #cbd5e1; font-size: 0.7rem; font-weight: 800; padding: 5px 11px; border-radius: 99px; cursor: pointer;
-      transition: all 0.15s ease;
     }
     .chip:hover { border-color: var(--neon); color: #fff; background: var(--neon-soft); }
 
     .input-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
-    .input-grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 10px; margin-bottom: 10px; }
-    label { display: block; font-size: 0.69rem; color: var(--muted); margin-bottom: 5px; font-weight: 700; letter-spacing: 0.2px; }
+    .input-grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap: 10px; margin-bottom: 10px; }
+    label { display: block; font-size: 0.69rem; color: var(--muted); margin-bottom: 5px; font-weight: 700; }
     input {
       width: 100%; background: rgba(4, 9, 8, 0.8); border: 1px solid rgba(255,255,255,0.1);
       color: var(--text); padding: 10px 12px; border-radius: 10px; font-size: 0.83rem; font-weight: 700;
-      font-family: var(--mono); transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      font-family: var(--mono);
     }
     input:focus { outline: none; border-color: var(--neon); box-shadow: 0 0 0 3px rgba(0, 245, 160, 0.14); }
 
     table { width: 100%; border-collapse: collapse; font-size: 0.77rem; }
     th, td { padding: 9px 8px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.05); font-family: var(--mono); }
     th { font-family: 'Inter', sans-serif; color: var(--muted); font-size: 0.66rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.6px; }
-    tr:hover td { background: rgba(255,255,255,0.02); }
     .logs {
       background: rgba(3, 7, 6, 0.9); border: 1px solid rgba(255,255,255,0.07);
       border-radius: 12px; padding: 12px 14px; height: 220px; overflow-y: auto;
@@ -1422,8 +1447,8 @@ HTML_UI = """
   <div class="hero">
     <div class="hero-top">
       <div>
-        <div class="logo">🟢 VAULTSKIMMER <span class="badge">v4.2 PRO BULL SPOT</span></div>
-        <div class="sub">Profits When Market Goes UP • Carry-Over Recovery • -3.5% Dump Escape Shield + Bottom-Bounce Re-Buy</div>
+        <div class="logo">🟢 VAULTSKIMMER <span class="badge">v4.3 PRO BULL SPOT</span></div>
+        <div class="sub">Verified Realized Profit Vault • Debt Cap + Auto-Restore • 20m Cooldown & RSI Filter • Team Debt-Clearing</div>
       </div>
       <div class="btn-row">
         <button class="btn btn-bull" onclick="installApp()" id="installBtn">📲 Install App</button>
@@ -1434,7 +1459,7 @@ HTML_UI = """
     </div>
     <div class="strip">
       <div style="font-weight:700; color:var(--text);"><span class="pulse-dot"></span><span id="apiStatus">Paper Simulation Active</span></div>
-      <div>Shield: <strong>-<span id="ruleEsc">3.5</span>% Dump Out → +<span id="ruleBounce">1.0</span>% Bottom Top-Up → +<span id="ruleRec">2.2</span>% Carry-Over Recovery</strong></div>
+      <div>v4.3 Shield: <strong>-<span id="ruleEsc">4.0</span>% Out → <span id="ruleCd">20</span>m Cooldown → +<span id="ruleBounce">1.8</span>% (RSI>35) → +<span id="ruleRec">1.6</span>% Recovery (Cap $<span id="ruleCap">0.50</span>)</strong></div>
       <div>Sweep: <strong id="lastUpdate" style="font-family:var(--mono);color:#fff;">--:--:--</strong> (<strong class="c-neon" id="scanMs">0</strong>ms | #<span id="cycleNum">0</span>)</div>
     </div>
   </div>
@@ -1460,10 +1485,7 @@ HTML_UI = """
     </div>
 
     <div class="panel-card">
-      <div class="sec-title">
-        <span>💰 Reset Demo & Active Coins</span>
-        <button class="btn-del" style="padding:4px 9px;font-size:0.66rem;" onclick="resetProfitVault()">🧹 Zero Vault</button>
-      </div>
+      <div class="sec-title"><span>💰 Reset Demo & Active Coins</span></div>
       <div style="display:grid; grid-template-columns: 1fr auto auto; gap:8px; align-items:end;">
         <div>
           <label>Demo Starting USDT ($)</label>
@@ -1485,20 +1507,20 @@ HTML_UI = """
     <div class="card kpi-card">
       <div class="lbl">2. Reserve Cash (Top-Up Pool)</div>
       <div class="val c-amber" id="freeUsdt">$100.00</div>
-      <div class="sub">Tops Up Step-Outs to Full Principal</div>
+      <div class="sub">Debt Cap: $<strong id="capLbl" style="color:#fff;">0.50</strong> / coin</div>
     </div>
     <div class="card kpi-card kpi-vault">
       <div class="lbl">
-        <span>3. 🔒 True Net Profit</span>
-        <button class="btn-del" style="padding:3px 8px;font-size:0.64rem;" onclick="resetTrueNetProfit()">🔄 Reset</button>
+        <span>3. 🔒 Verified Skim Profit</span>
+        <button class="btn-del" style="padding:3px 8px;font-size:0.64rem;" onclick="resetProfitVault()">🔄 Reset</button>
       </div>
       <div class="val c-neon" id="profitVault">+$0.0000</div>
-      <div class="sub">Wins: <strong id="skimCount" style="color:#fff;">0</strong> | Deposit: $<span id="depLbl">20.00</span></div>
+      <div class="sub">Wins: <strong id="skimCount" style="color:#fff;">0</strong> | Zero Fake Deposit Cash</div>
     </div>
     <div class="card kpi-card">
-      <div class="lbl">4. True Total Net Worth</div>
+      <div class="lbl">4. Total Spot Net Worth</div>
       <div class="val c-cyan" id="totalPort">$100.0000</div>
-      <div class="sub">Shield: <strong>-<span id="cardEsc">3.5</span>% / +<span id="cardBounce">1.0</span>% / +<span id="cardRec">2.2</span>%</strong></div>
+      <div class="sub">Team Debt-Clearing: <strong>50% Active</strong></div>
     </div>
   </div>
 
@@ -1506,8 +1528,8 @@ HTML_UI = """
   <div class="grid-main">
     <div class="card">
       <div class="sec-title">
-        <span>🟢 Active Spot Long Loops (-3.5% Dump Escape Shield)</span>
-        <span style="font-size:0.7rem;color:var(--cyan);">Carry-Over Recovery Active</span>
+        <span>🟢 Active Spot Long Loops (v4.3 Smart Recovery)</span>
+        <span style="font-size:0.7rem;color:var(--cyan);">Auto-Restores to Original Principal</span>
       </div>
       <div id="positionsBox"></div>
     </div>
@@ -1545,36 +1567,36 @@ HTML_UI = """
 
       <!-- ENGINE PARAMETERS -->
       <div class="card">
-        <div class="sec-title">⚙️ Dump Shield & Bull Skim Parameters</div>
+        <div class="sec-title">⚙️ v4.3 Shield, Debt Cap & Cooldown Rules</div>
         <div class="input-grid-3">
           <div>
             <label>Escape Dump (%)</label>
-            <input type="number" id="cfgEsc" step="0.1" value="3.5" />
+            <input type="number" id="cfgEsc" step="0.1" value="4.0" />
           </div>
           <div>
             <label>Bottom Bounce (%)</label>
-            <input type="number" id="cfgBounce" step="0.1" value="1.0" />
+            <input type="number" id="cfgBounce" step="0.1" value="1.8" />
           </div>
           <div>
             <label>Recovery Pump (%)</label>
-            <input type="number" id="cfgRec" step="0.1" value="2.2" />
+            <input type="number" id="cfgRec" step="0.1" value="1.6" />
           </div>
         </div>
         <div class="input-grid-3">
-          <div>
-            <label>Default Buy ($)</label>
-            <input type="number" id="cfgSize" step="5" value="10" />
-          </div>
           <div>
             <label>Normal Skim (%)</label>
             <input type="number" id="cfgTarget" step="0.05" value="1.0" />
           </div>
           <div>
-            <label>Live Deposit ($)</label>
-            <input type="number" id="cfgDeposit" step="0.01" value="20.00" />
+            <label>Debt Cap ($/coin)</label>
+            <input type="number" id="cfgCap" step="0.10" value="0.50" />
+          </div>
+          <div>
+            <label>Cooldown (mins)</label>
+            <input type="number" id="cfgCd" step="5" value="20" />
           </div>
         </div>
-        <button class="btn btn-bull" style="width:100%;padding:12px;" onclick="saveConfig()">💾 Save v4.2 Spot Engine Settings</button>
+        <button class="btn btn-bull" style="width:100%;padding:12px;" onclick="saveConfig()">💾 Save v4.3 Spot Engine Settings</button>
       </div>
     </div>
   </div>
@@ -1630,6 +1652,10 @@ HTML_UI = """
 </div>
 
 <script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => { navigator.serviceWorker.register('/sw.js').catch(() => {}); });
+  }
+
   let deferredPrompt = null;
   window.addEventListener('beforeinstallprompt', (e) => {
     e.preventDefault();
@@ -1711,22 +1737,10 @@ HTML_UI = """
     await refresh();
   }
 
-  async function resetTrueNetProfit() {
-    const r = await fetch('/api/reset_true_net_profit', { method: 'POST' });
-    const d = await r.json();
-    if (d.ok && d.live_starting_deposit !== undefined) {
-      document.getElementById('cfgDeposit').value = Number(d.live_starting_deposit).toFixed(2);
-    }
-    await refresh();
-  }
-
   async function launchCustomLong(pairOverride) {
     const pair = pairOverride || document.getElementById('customPairInput').value.trim();
     const amt = document.getElementById('customAmtInput').value || 10;
-    if (!pair) {
-      alert('Select or type a token symbol first.');
-      return;
-    }
+    if (!pair) { alert('Select or type a token symbol first.'); return; }
     const r = await fetch('/api/manual_long', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -1772,12 +1786,12 @@ HTML_UI = """
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
-        slot_size_usdt: document.getElementById('cfgSize').value,
         skim_profit_pct: document.getElementById('cfgTarget').value,
         escape_dump_pct: document.getElementById('cfgEsc').value,
         reentry_bounce_pct: document.getElementById('cfgBounce').value,
         recovery_pump_pct: document.getElementById('cfgRec').value,
-        live_starting_deposit: document.getElementById('cfgDeposit').value
+        max_debt_per_coin: document.getElementById('cfgCap').value,
+        cooldown_minutes: document.getElementById('cfgCd').value
       })
     });
     await refresh();
@@ -1790,13 +1804,13 @@ HTML_UI = """
       const s = await r.json();
 
       if (!cfgLoaded) {
-        document.getElementById('cfgSize').value = s.slot_size_usdt || 10;
         document.getElementById('customAmtInput').value = s.slot_size_usdt || 10;
         document.getElementById('cfgTarget').value = s.skim_profit_pct || 1.0;
-        document.getElementById('cfgEsc').value = s.escape_dump_pct || 3.5;
-        document.getElementById('cfgBounce').value = s.reentry_bounce_pct || 1.0;
-        document.getElementById('cfgRec').value = s.recovery_pump_pct || 2.2;
-        document.getElementById('cfgDeposit').value = s.live_starting_deposit || 20.00;
+        document.getElementById('cfgEsc').value = s.escape_dump_pct || 4.0;
+        document.getElementById('cfgBounce').value = s.reentry_bounce_pct || 1.8;
+        document.getElementById('cfgRec').value = s.recovery_pump_pct || 1.6;
+        document.getElementById('cfgCap').value = s.max_debt_per_coin !== undefined ? s.max_debt_per_coin : 0.50;
+        document.getElementById('cfgCd').value = s.cooldown_minutes !== undefined ? s.cooldown_minutes : 20;
         document.getElementById('resetUsdtInput').value = s.paper_starting_bankroll || 100;
         cfgLoaded = true;
       }
@@ -1805,18 +1819,18 @@ HTML_UI = """
       document.getElementById('scanMs').innerText = s.last_scan_ms;
       document.getElementById('cycleNum').innerText = s.cycle_count;
 
-      const escVal = Number(s.escape_dump_pct || 3.5).toFixed(1);
-      const bounceVal = Number(s.reentry_bounce_pct || 1.0).toFixed(1);
-      const recVal = Number(s.recovery_pump_pct || 2.2).toFixed(1);
-      const depVal = Number(s.live_starting_deposit || 20.00);
+      const escVal = Number(s.escape_dump_pct || 4.0).toFixed(1);
+      const bounceVal = Number(s.reentry_bounce_pct || 1.8).toFixed(1);
+      const recVal = Number(s.recovery_pump_pct || 1.6).toFixed(1);
+      const capVal = Number(s.max_debt_per_coin !== undefined ? s.max_debt_per_coin : 0.50).toFixed(2);
+      const cdVal = Number(s.cooldown_minutes !== undefined ? s.cooldown_minutes : 20);
 
       document.getElementById('ruleEsc').innerText = escVal;
       document.getElementById('ruleBounce').innerText = bounceVal;
       document.getElementById('ruleRec').innerText = recVal;
-      document.getElementById('cardEsc').innerText = escVal;
-      document.getElementById('cardBounce').innerText = bounceVal;
-      document.getElementById('cardRec').innerText = recVal;
-      document.getElementById('depLbl').innerText = depVal.toFixed(2);
+      document.getElementById('ruleCap').innerText = capVal;
+      document.getElementById('ruleCd').innerText = cdVal;
+      document.getElementById('capLbl').innerText = capVal;
 
       const modeBtn = document.getElementById('modeBtn');
       modeBtn.innerText = s.mode === 'LIVE' ? '🔀 Mode: LIVE SPOT' : '🔀 Mode: PAPER';
@@ -1831,7 +1845,7 @@ HTML_UI = """
       keys.forEach(k => { sumEq += Number(posMap[k].current_equity_usdt || 0); });
 
       const freeCash = s.mode === 'LIVE' ? Number(s.live_spot_usdt || 0) : Number(s.paper_usdt_balance || 0);
-      const trackedProf = s.mode === 'LIVE' ? Number(s.stats.live_profit_usdt || 0) : Number(s.stats.paper_profit_usdt || 0);
+      const verifiedProf = s.mode === 'LIVE' ? Number(s.stats.live_profit_usdt || 0) : Number(s.stats.paper_profit_usdt || 0);
       const skims = s.mode === 'LIVE' ? (s.stats.live_skims || 0) : (s.stats.paper_skims || 0);
 
       document.getElementById('deployedVal').innerText = '$' + sumEq.toFixed(2);
@@ -1839,13 +1853,11 @@ HTML_UI = """
       document.getElementById('freeUsdt').innerText = '$' + freeCash.toFixed(2);
       document.getElementById('skimCount').innerText = skims;
 
-      const trueNetWorth = s.mode === 'LIVE' ? (sumEq + freeCash) : (sumEq + freeCash + trackedProf);
+      const trueNetWorth = s.mode === 'LIVE' ? (sumEq + freeCash) : (sumEq + freeCash + verifiedProf);
       document.getElementById('totalPort').innerText = '$' + trueNetWorth.toFixed(4);
 
-      const displayProfit = s.mode === 'LIVE' ? (trueNetWorth - depVal) : trackedProf;
       const profEl = document.getElementById('profitVault');
-      profEl.innerText = (displayProfit >= 0 ? '+$' : '-$') + Math.abs(displayProfit).toFixed(4);
-      profEl.style.color = displayProfit >= 0 ? 'var(--neon)' : 'var(--crimson)';
+      profEl.innerText = '+$' + Math.max(0, verifiedProf).toFixed(4);
 
       const pBox = document.getElementById('positionsBox');
       if (keys.length === 0) {
@@ -1860,17 +1872,17 @@ HTML_UI = """
           const slotSkims = Number(p.slot_skims || 0);
           const slotProf = Number(p.slot_profit_usdt || 0);
           const borrowed = Number(p.borrowed_from_reserve_usdt || 0);
-          const goalPct = p.in_recovery ? Number(s.recovery_pump_pct || 2.2) : Number(s.skim_profit_pct || 1.0);
+          const goalPct = p.in_recovery ? Number(s.recovery_pump_pct || 1.6) : Number(s.skim_profit_pct || 1.0);
           const prog = phase === 'STEPPED_OUT_HOLD' ? 50 : Math.max(0, Math.min(100, (pnl / goalPct) * 100));
 
           const phaseBadge = phase === 'STEPPED_OUT_HOLD'
-            ? `<span class="step-pill" style="border-color:var(--amber);color:var(--amber);">🛡️ HOLDING $${Number(p.margin_usdt).toFixed(2)} (RE-BUYS $${Number(p.base_slot_usdt || 10).toFixed(2)})</span>`
+            ? `<span class="step-pill" style="border-color:var(--amber);color:var(--amber);">🛡️ SAFE $${Number(p.margin_usdt).toFixed(2)} (BASE $${Number(p.base_slot_usdt || 10).toFixed(2)})</span>`
             : (p.in_recovery
-                ? `<span class="step-pill">🎯 RECOVERY (DEBT: $${borrowed.toFixed(2)})</span>`
+                ? `<span class="step-pill">🎯 RECOVERY ($${Number(p.margin_usdt).toFixed(2)} | DEBT: $${borrowed.toFixed(2)})</span>`
                 : `<span class="bull-pill">$${Number(p.margin_usdt).toFixed(2)} Spot</span>`);
 
           const actionBtn = phase === 'STEPPED_OUT_HOLD'
-            ? `<button class="btn-step" onclick="stepOutOrResnipe('${p.pair}')">🎯 Top-Up & Re-Buy Now</button>`
+            ? `<button class="btn-step" onclick="stepOutOrResnipe('${p.pair}')">🎯 Re-Buy Now</button>`
             : `<button class="btn-step" onclick="stepOutOrResnipe('${p.pair}')">🛡️ Step Out to USDT Now</button>`;
 
           return `
@@ -1890,12 +1902,12 @@ HTML_UI = """
                 <div>${phase === 'STEPPED_OUT_HOLD' ? `Bottom Watched: <strong>${fmtPx(p.bottom_watch_price)}</strong>` : `Entry Floor: <strong>${fmtPx(p.entry_price)}</strong>`}</div>
                 <div>${phase === 'STEPPED_OUT_HOLD' ? `Re-Buy Trigger: <strong class="c-amber">${fmtPx(p.reentry_trigger_price)}</strong>` : `Sell Skim Target: <strong class="c-neon">${fmtPx(p.target_sell_price)}</strong>`}</div>
                 <div>Live Price: <strong>${fmtPx(p.last_price)}</strong></div>
-                <div>${phase === 'STEPPED_OUT_HOLD' ? `Reserve Patch: <strong class="c-cyan">+$${Math.max(0, Number(p.base_slot_usdt || 10) - Number(p.margin_usdt)).toFixed(2)}</strong>` : `-${escVal}% Shield: <strong class="c-crimson">${fmtPx(p.escape_stop_price)}</strong>`}</div>
+                <div>${phase === 'STEPPED_OUT_HOLD' ? `Debt Room Left: <strong class="c-cyan">$${Math.max(0, Number(capVal) - borrowed).toFixed(2)}</strong>` : `-${escVal}% Shield: <strong class="c-crimson">${fmtPx(p.escape_stop_price)}</strong>`}</div>
               </div>
 
               <div style="display:flex;justify-content:space-between;font-size:0.71rem;color:var(--muted);">
                 <span>${p.status}</span>
-                <strong class="c-neon">${phase === 'STEPPED_OUT_HOLD' ? 'Watching Bottom' : `${prog.toFixed(0)}% to Skim`}</strong>
+                <strong class="c-neon">${phase === 'STEPPED_OUT_HOLD' ? 'Protected' : `${prog.toFixed(0)}% to Skim`}</strong>
               </div>
               <div class="track"><div class="fill" style="width:${prog.toFixed(1)}%"></div></div>
 
