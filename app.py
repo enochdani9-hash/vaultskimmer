@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify, Response, render_template_string
 
 app = Flask(__name__)
 
-STATE_FILE = "vaultskimmer_v4_4_state.json"
+STATE_FILE = "vaultskimmer_v4_5_state.json"
 GATE_HOST = "https://api.gateio.ws"
 GATE_PREFIX = "/api/v4"
 
@@ -58,7 +58,6 @@ DEFAULT_STATE = {
     "reentry_bounce_pct": 1.6,      # Trails new bottom; re-buys on +1.6% bounce from lowest low
     "recovery_pump_pct": 1.60,      # Faster +1.60% net recovery target to clear debt quickly
     "skim_profit_pct": 1.00,        # Global default Spot Skim Target (overridable per coin)
-    "trail_pullback_pct": 0.22,     # Trailing Peak Rider pullback floor
     "spot_fee_buffer_pct": 0.40,    # Gate.io Spot round-trip fee (baked into target price)
     "max_debt_per_coin": 0.50,      # Debt Cap: max $0.50 borrowed from Reserve per coin
     "cooldown_minutes": 20,         # 20-minute lock after Dump Shield triggers
@@ -123,10 +122,15 @@ def load_state():
                     p.setdefault("bottom_watch_price", float(p.get("last_price", 0.0)))
                     p.setdefault("cooldown_until", 0.0)
                     p.setdefault("custom_skim_pct", None)
+                    p.setdefault("custom_escape_pct", None)
+                    p.setdefault("custom_bounce_pct", None)
+                    p.setdefault("custom_recovery_pct", None)
+                    p.setdefault("custom_debt_cap", None)
+                    p.setdefault("custom_cooldown_mins", None)
         except Exception as e:
             add_log(f"State load notice: {e}")
     else:
-        for old_fn in ["vaultskimmer_v4_3_state.json", "vaultskimmer_v4_2_state.json"]:
+        for old_fn in ["vaultskimmer_v4_4_state.json", "vaultskimmer_v4_3_state.json"]:
             if os.path.exists(old_fn):
                 try:
                     with open(old_fn, "r") as f:
@@ -368,10 +372,9 @@ def compute_bull_score(pair, tk):
 
 
 # =============================================================================
-# MAIN EXECUTION ENGINE — VAULTSKIMMER v4.4 PRO
-# - Per-Token Custom Skim % Override
-# - Trailing Bottom Re-Buy (tracks lowest low even if coin drops -6%+ more)
-# - Uniform 0.00% Market-Move PnL Display (fee buffer baked cleanly into target)
+# MAIN EXECUTION ENGINE — VAULTSKIMMER v4.5 PRO
+# - INSTANT Skim & Re-Buy the exact tick target_sell_price is hit (no trailing delay)
+# - Full Per-Token Rule Overrides (Skim, Escape, Bounce, Recovery, Debt Cap, Cooldown)
 # =============================================================================
 def run_bull_cycle(force_manual=False):
     if not cycle_lock.acquire(blocking=force_manual):
@@ -381,14 +384,13 @@ def run_bull_cycle(force_manual=False):
     try:
         with state_lock:
             mode = STATE.get("mode", "PAPER")
-            escape_dump_pct = float(STATE.get("escape_dump_pct", 4.0))
-            reentry_bounce_pct = float(STATE.get("reentry_bounce_pct", 1.6))
-            recovery_pump_pct = float(STATE.get("recovery_pump_pct", 1.60))
+            global_escape_pct = float(STATE.get("escape_dump_pct", 4.0))
+            global_bounce_pct = float(STATE.get("reentry_bounce_pct", 1.6))
+            global_rec_pct = float(STATE.get("recovery_pump_pct", 1.60))
             global_skim_pct = float(STATE.get("skim_profit_pct", 1.00))
-            trail_pullback = float(STATE.get("trail_pullback_pct", 0.22))
             fee_buf = float(STATE.get("spot_fee_buffer_pct", 0.40))
-            max_debt_cap = float(STATE.get("max_debt_per_coin", 0.50))
-            cooldown_mins = float(STATE.get("cooldown_minutes", 20))
+            global_debt_cap = float(STATE.get("max_debt_per_coin", 0.50))
+            global_cd_mins = float(STATE.get("cooldown_minutes", 20))
             has_keys = bool(STATE.get("api_key") and STATE.get("api_secret"))
             active_pairs = list(STATE["spot_positions"].keys())
 
@@ -435,7 +437,14 @@ def run_bull_cycle(force_manual=False):
             margin_usdt = float(pos["margin_usdt"])
             base_slot = float(pos.get("base_slot_usdt") or 10.0)
             current_debt = float(pos.get("borrowed_from_reserve_usdt", 0.0))
+
+            # Per-token overrides (fall back cleanly to global settings)
             token_skim_pct = float(pos["custom_skim_pct"]) if pos.get("custom_skim_pct") is not None else global_skim_pct
+            token_esc_pct = float(pos["custom_escape_pct"]) if pos.get("custom_escape_pct") is not None else global_escape_pct
+            token_bounce_pct = float(pos["custom_bounce_pct"]) if pos.get("custom_bounce_pct") is not None else global_bounce_pct
+            token_rec_pct = float(pos["custom_recovery_pct"]) if pos.get("custom_recovery_pct") is not None else global_rec_pct
+            token_debt_cap = float(pos["custom_debt_cap"]) if pos.get("custom_debt_cap") is not None else global_debt_cap
+            token_cd_mins = float(pos["custom_cooldown_mins"]) if pos.get("custom_cooldown_mins") is not None else global_cd_mins
 
             # =================================================================
             # PHASE 2: STEPPED_OUT_HOLD (Trails New Lowest Bottom Dynamically)
@@ -446,7 +455,7 @@ def run_bull_cycle(force_manual=False):
                     bottom_px = live_px
                     pos["bottom_watch_price"] = bottom_px
 
-                reentry_trigger_px = bottom_px * (1.0 + (reentry_bounce_pct / 100.0))
+                reentry_trigger_px = bottom_px * (1.0 + (token_bounce_pct / 100.0))
                 pos["reentry_trigger_price"] = reentry_trigger_px
                 bounce_from_bottom_pct = ((live_px - bottom_px) / bottom_px) * 100.0
 
@@ -454,7 +463,7 @@ def run_bull_cycle(force_manual=False):
                 pos["pnl_pct"] = 0.0
                 pos["pnl_usdt"] = 0.0
 
-                debt_room = max(0.0, round(max_debt_cap - current_debt, 4))
+                debt_room = max(0.0, round(token_debt_cap - current_debt, 4))
                 shortfall_needed = max(0.0, round(base_slot - margin_usdt, 4))
                 allowed_borrow = min(shortfall_needed, debt_room)
 
@@ -468,7 +477,7 @@ def run_bull_cycle(force_manual=False):
                     continue
 
                 if live_px >= reentry_trigger_px and coin_rsi >= 35.0:
-                    rec_req_pump = recovery_pump_pct + fee_buf
+                    rec_req_pump = token_rec_pct + fee_buf
                     new_target_px = live_px * (1.0 + (rec_req_pump / 100.0))
 
                     if mode == "PAPER":
@@ -486,9 +495,7 @@ def run_bull_cycle(force_manual=False):
                             pos["borrowed_from_reserve_usdt"] = round(current_debt + patch_from_res, 4)
                             pos["entry_price"] = live_px
                             pos["target_sell_price"] = new_target_px
-                            pos["escape_stop_price"] = live_px * (1.0 - (escape_dump_pct / 100.0))
-                            pos["trailing_active"] = False
-                            pos["highest_price"] = live_px
+                            pos["escape_stop_price"] = live_px * (1.0 - (token_esc_pct / 100.0))
                             cap_note = " (Debt Capped)" if patch_from_res < shortfall_needed else ""
                             pos["status"] = f"🎯 Re-Bought ${restored_margin:.2f}{cap_note} @ {fmt_px(live_px)} | Target {fmt_px(new_target_px)}"
                             add_log(
@@ -516,13 +523,11 @@ def run_bull_cycle(force_manual=False):
                                     pos["borrowed_from_reserve_usdt"] = round(current_debt + patch_from_res, 4)
                                     pos["entry_price"] = avg_px
                                     pos["target_sell_price"] = new_target_px
-                                    pos["escape_stop_price"] = avg_px * (1.0 - (escape_dump_pct / 100.0))
-                                    pos["trailing_active"] = False
-                                    pos["highest_price"] = avg_px
+                                    pos["escape_stop_price"] = avg_px * (1.0 - (token_esc_pct / 100.0))
                                     pos["status"] = f"🎯 Live Re-Bought ${buy_usdt:.2f} @ {fmt_px(avg_px)}"
                                     add_log(f"🎯 [LIVE RE-BUY][{pair}] Bought ${buy_usdt:.2f} @ {fmt_px(avg_px)} (From Bottom {fmt_px(bottom_px)})")
                 else:
-                    need_bounce = max(0.0, reentry_bounce_pct - bounce_from_bottom_pct)
+                    need_bounce = max(0.0, token_bounce_pct - bounce_from_bottom_pct)
                     rsi_tag = f"RSI {coin_rsi:.0f} (need >35)" if coin_rsi < 35.0 else f"RSI {coin_rsi:.0f} OK"
                     pos["status"] = (
                         f"🛡️ Trailing Bottom {fmt_px(bottom_px)} | {rsi_tag} | "
@@ -531,21 +536,20 @@ def run_bull_cycle(force_manual=False):
                 continue
 
             # =================================================================
-            # PHASE 1: ACTIVE_LONG (Uniform 0.00% Display + Fee-Protected Target)
+            # PHASE 1: ACTIVE_LONG (Instant Skim Trigger + Uniform 0.00% PnL)
             # =================================================================
             entry_px = float(pos["entry_price"])
             in_rec = bool(pos.get("in_recovery", False)) or (current_debt > 0.01) or (margin_usdt < base_slot - 0.05)
             pos["in_recovery"] = in_rec
 
-            active_skim_goal_pct = recovery_pump_pct if in_rec else token_skim_pct
+            active_skim_goal_pct = token_rec_pct if in_rec else token_skim_pct
             required_pump_pct = active_skim_goal_pct + fee_buf
 
             target_sell_px = entry_px * (1.0 + (required_pump_pct / 100.0))
-            escape_stop_px = entry_px * (1.0 - (escape_dump_pct / 100.0))
+            escape_stop_px = entry_px * (1.0 - (token_esc_pct / 100.0))
             pos["target_sell_price"] = target_sell_px
             pos["escape_stop_price"] = escape_stop_px
 
-            # Uniform pure market-move PnL (matches BearSkimmer 1-to-1 at entry!)
             coin_move_pct = ((live_px - entry_px) / entry_px) * 100.0
             display_pnl_usdt = margin_usdt * (coin_move_pct / 100.0)
             net_after_fee_pct = coin_move_pct - fee_buf
@@ -555,11 +559,11 @@ def run_bull_cycle(force_manual=False):
             pos["pnl_usdt"] = round(display_pnl_usdt, 4)
             pos["current_equity_usdt"] = round(margin_usdt + display_pnl_usdt, 4)
 
-            # 1) DUMP ESCAPE SHIELD + 20-MIN COOLDOWN
-            if coin_move_pct <= -escape_dump_pct:
-                held_cash = round(margin_usdt * (1.0 - ((escape_dump_pct + (fee_buf / 2.0)) / 100.0)), 4)
-                reentry_px = live_px * (1.0 + (reentry_bounce_pct / 100.0))
-                cd_target = now_ts + (cooldown_mins * 60.0)
+            # 1) DUMP ESCAPE SHIELD + COOLDOWN
+            if coin_move_pct <= -token_esc_pct:
+                held_cash = round(margin_usdt * (1.0 - ((token_esc_pct + (fee_buf / 2.0)) / 100.0)), 4)
+                reentry_px = live_px * (1.0 + (token_bounce_pct / 100.0))
+                cd_target = now_ts + (token_cd_mins * 60.0)
 
                 if mode == "PAPER":
                     with state_lock:
@@ -572,8 +576,8 @@ def run_bull_cycle(force_manual=False):
                         pos["step_outs_count"] = int(pos.get("step_outs_count", 0)) + 1
                         pos["pnl_pct"] = 0.0
                         pos["pnl_usdt"] = 0.0
-                        pos["status"] = f"⏳ Cooldown {int(cooldown_mins)}m | Trailing Bottom from {fmt_px(live_px)}"
-                        add_log(f"🛡️ [-{escape_dump_pct}% DUMP SHIELD][{pair}] Sold @ {fmt_px(live_px)} (${held_cash:.2f} safe) — Trailing new bottom.")
+                        pos["status"] = f"⏳ Cooldown {int(token_cd_mins)}m | Trailing Bottom from {fmt_px(live_px)}"
+                        add_log(f"🛡️ [-{token_esc_pct}% DUMP SHIELD][{pair}] Sold @ {fmt_px(live_px)} (${held_cash:.2f} safe) — Trailing new bottom.")
                     continue
                 elif mode == "LIVE" and has_keys:
                     code, resp = place_spot_market_sell(pair, float(pos.get("coin_qty", 0.0)))
@@ -591,36 +595,20 @@ def run_bull_cycle(force_manual=False):
                             pos["step_outs_count"] = int(pos.get("step_outs_count", 0)) + 1
                             pos["pnl_pct"] = 0.0
                             pos["pnl_usdt"] = 0.0
-                            pos["status"] = f"⏳ Cooldown {int(cooldown_mins)}m | Live Stepped Out @ {fmt_px(live_px)}"
+                            pos["status"] = f"⏳ Cooldown {int(token_cd_mins)}m | Live Stepped Out @ {fmt_px(live_px)}"
                             add_log(f"🛡️ [LIVE DUMP SHIELD][{pair}] Sold Spot @ {fmt_px(live_px)} (${real_usdt:.2f} safe) — Trailing new bottom.")
                         continue
 
-            # 2) PUMP TARGET CHECK
+            # 2) INSTANT SKIM TRIGGER (NO TRAILING DELAY)
             should_skim_and_rebuy = False
             if live_px >= target_sell_px:
-                if not pos.get("trailing_active"):
-                    pos["trailing_active"] = True
-                    pos["highest_price"] = live_px
-                    pos["status"] = f"🚀 Target Hit! Trailing Peak Rider Armed (+{coin_move_pct:.2f}%)"
-                else:
-                    if live_px > float(pos.get("highest_price", live_px)):
-                        pos["highest_price"] = live_px
-                    high_watermark = float(pos["highest_price"])
-                    pullback_floor_px = max(target_sell_px, high_watermark * (1.0 - (trail_pullback / 100.0)))
-                    if live_px <= pullback_floor_px:
-                        should_skim_and_rebuy = True
-                    else:
-                        pos["status"] = f"🟢 Riding Pump (+{coin_move_pct:.2f}%) | Lock Floor @ {fmt_px(pullback_floor_px)}"
+                should_skim_and_rebuy = True
             else:
-                if pos.get("trailing_active") and net_after_fee_pct >= active_skim_goal_pct:
-                    should_skim_and_rebuy = True
-                else:
-                    pos["trailing_active"] = False
-                    need_pump = max(0.0, ((target_sell_px - live_px) / live_px) * 100.0)
-                    mode_tag = f"+{recovery_pump_pct}% Recovery (Debt: ${current_debt:.2f})" if in_rec else f"+{token_skim_pct}% Skim"
-                    pos["status"] = f"Need +{need_pump:.2f}% for {mode_tag} | -{escape_dump_pct}% Shield @ {fmt_px(escape_stop_px)}"
+                need_pump = max(0.0, ((target_sell_px - live_px) / live_px) * 100.0)
+                mode_tag = f"+{token_rec_pct}% Recovery (Debt: ${current_debt:.2f})" if in_rec else f"+{token_skim_pct}% Skim"
+                pos["status"] = f"Need +{need_pump:.2f}% for {mode_tag} | -{token_esc_pct}% Shield @ {fmt_px(escape_stop_px)}"
 
-            # 3) EXECUTE SKIM + AUTO-RESTORE + TEAM DEBT-CLEARING
+            # 3) EXECUTE INSTANT SKIM & RE-BUY + AUTO-RESTORE + TEAM DEBT-CLEARING
             if should_skim_and_rebuy:
                 gross_gain_usdt = max(0.02, round(margin_usdt * (max(active_skim_goal_pct, net_after_fee_pct) / 100.0), 4))
                 borrowed_res = float(pos.get("borrowed_from_reserve_usdt", 0.0))
@@ -662,7 +650,7 @@ def run_bull_cycle(force_manual=False):
 
                 pure_vault_profit = max(0.0, round(leftover_gain - team_help, 4))
                 still_in_recovery = remaining_debt > 0.01
-                next_goal = recovery_pump_pct if still_in_recovery else token_skim_pct
+                next_goal = token_rec_pct if still_in_recovery else token_skim_pct
                 new_target_px = live_px * (1.0 + ((next_goal + fee_buf) / 100.0))
 
                 if mode == "PAPER":
@@ -690,7 +678,7 @@ def run_bull_cycle(force_manual=False):
                         })
                         help_note = f" | Team Help -> {helped_pair} (-${team_help:.2f})" if team_help > 0 else ""
                         add_log(
-                            f"🔒💎 [BULL SKIM][{pair}] +{coin_move_pct:.2f}% | Refund: +${reserve_refund:.2f} | "
+                            f"⚡🔒 [INSTANT SKIM][{pair}] +{coin_move_pct:.2f}% | Refund: +${reserve_refund:.2f} | "
                             f"Vault: +${pure_vault_profit:.4f}{help_note}{restored_principal_msg}"
                         )
 
@@ -702,12 +690,10 @@ def run_bull_cycle(force_manual=False):
                         pos["current_equity_usdt"] = next_buy_size
                         pos["entry_price"] = live_px
                         pos["target_sell_price"] = new_target_px
-                        pos["escape_stop_price"] = live_px * (1.0 - (escape_dump_pct / 100.0))
+                        pos["escape_stop_price"] = live_px * (1.0 - (token_esc_pct / 100.0))
                         pos["coin_move_pct"] = 0.0
                         pos["pnl_pct"] = 0.0
                         pos["pnl_usdt"] = 0.0
-                        pos["trailing_active"] = False
-                        pos["highest_price"] = live_px
                         pos["status"] = f"Cycle #{pos['slot_skims']} Done — Re-Bought ${next_buy_size:.2f} @ {fmt_px(live_px)}"
 
                 elif mode == "LIVE" and has_keys:
@@ -743,14 +729,12 @@ def run_bull_cycle(force_manual=False):
                             pos["current_equity_usdt"] = buy_amt
                             pos["entry_price"] = new_entry
                             pos["target_sell_price"] = new_target_px
-                            pos["escape_stop_price"] = new_entry * (1.0 - (escape_dump_pct / 100.0))
+                            pos["escape_stop_price"] = new_entry * (1.0 - (token_esc_pct / 100.0))
                             pos["pnl_pct"] = 0.0
                             pos["pnl_usdt"] = 0.0
-                            pos["trailing_active"] = False
-                            pos["highest_price"] = new_entry
                             help_note = f" | Team Help -> {helped_pair} (-${team_help:.2f})" if team_help > 0 else ""
                             add_log(
-                                f"🔒💎 [LIVE SKIM][{pair}] Refund: ${reserve_refund:.2f} | Vault: +${pure_vault_profit:.4f}"
+                                f"⚡🔒 [LIVE INSTANT SKIM][{pair}] Refund: ${reserve_refund:.2f} | Vault: +${pure_vault_profit:.4f}"
                                 f"{help_note}{restored_principal_msg}"
                             )
 
@@ -769,7 +753,7 @@ def run_bull_cycle(force_manual=False):
 
 def background_worker():
     load_state()
-    add_log("🟢 VaultSkimmer v4.4 PRO Online — Per-Token Skim Edit + Trailing Bottom Re-Buy + Uniform 0.00% PnL.")
+    add_log("🟢 VaultSkimmer v4.5 PRO Online — Instant Target Skim + Full Per-Token Rules Editor.")
     while True:
         run_bull_cycle(force_manual=False)
         time.sleep(3.5)
@@ -795,7 +779,7 @@ def check_worker():
 @app.route("/manifest.json")
 def pwa_manifest():
     return jsonify({
-        "name": "VaultSkimmer v4.4 PRO",
+        "name": "VaultSkimmer v4.5 PRO",
         "short_name": "VaultSkimmer",
         "start_url": "/",
         "display": "standalone",
@@ -851,26 +835,42 @@ def api_toggle_mode():
     return jsonify({"ok": True})
 
 
-@app.route("/api/update_coin_skim", methods=["POST"])
-def api_update_coin_skim():
+@app.route("/api/update_coin_settings", methods=["POST"])
+def api_update_coin_settings():
     d = request.json or {}
     pair = d.get("pair", "")
-    raw_val = d.get("skim_pct")
     with state_lock:
         pos = STATE["spot_positions"].get(pair)
         if not pos:
             return jsonify({"ok": False, "error": "Coin not found"}), 400
         try:
-            new_skim = max(0.2, min(20.0, float(raw_val)))
+            skim = max(0.1, min(20.0, float(d.get("skim_pct"))))
+            esc = max(0.5, min(50.0, float(d.get("escape_pct"))))
+            bounce = max(0.2, min(20.0, float(d.get("bounce_pct"))))
+            rec = max(0.2, min(20.0, float(d.get("recovery_pct"))))
+            cap = max(0.0, float(d.get("debt_cap")))
+            cd = max(0, int(float(d.get("cooldown_mins"))))
         except Exception:
-            return jsonify({"ok": False, "error": "Enter a valid percentage (e.g. 1.25)"}), 400
+            return jsonify({"ok": False, "error": "Enter valid numeric values for all fields"}), 400
 
-        pos["custom_skim_pct"] = round(new_skim, 2)
+        pos["custom_skim_pct"] = round(skim, 2)
+        pos["custom_escape_pct"] = round(esc, 2)
+        pos["custom_bounce_pct"] = round(bounce, 2)
+        pos["custom_recovery_pct"] = round(rec, 2)
+        pos["custom_debt_cap"] = round(cap, 2)
+        pos["custom_cooldown_mins"] = cd
+
         fee_buf = float(STATE.get("spot_fee_buffer_pct", 0.40))
-        if not pos.get("in_recovery"):
-            pos["target_sell_price"] = float(pos["entry_price"]) * (1.0 + ((new_skim + fee_buf) / 100.0))
-        add_log(f"✏️ [{pair}] Custom Skim Target updated to +{new_skim:.2f}% (Target: {fmt_px(pos['target_sell_price'])}).")
+        active_goal = rec if pos.get("in_recovery") else skim
+        ep = float(pos["entry_price"])
+        pos["target_sell_price"] = ep * (1.0 + ((active_goal + fee_buf) / 100.0))
+        pos["escape_stop_price"] = ep * (1.0 - (esc / 100.0))
+        add_log(
+            f"✏️ [{pair}] Custom Rules Saved: Skim +{skim}% | Shield -{esc}% | Bounce +{bounce}% | "
+            f"Rec +{rec}% | Cap ${cap:.2f} | Cooldown {cd}m"
+        )
         save_state()
+    run_bull_cycle(force_manual=True)
     return jsonify({"ok": True})
 
 
@@ -905,6 +905,11 @@ def api_sync_live_positions():
                     "borrowed_from_reserve_usdt": 0.0,
                     "cooldown_until": 0.0,
                     "custom_skim_pct": None,
+                    "custom_escape_pct": None,
+                    "custom_bounce_pct": None,
+                    "custom_recovery_pct": None,
+                    "custom_debt_cap": None,
+                    "custom_cooldown_mins": None,
                     "coin_qty": qty,
                     "base_slot_usdt": val,
                     "margin_usdt": val,
@@ -921,8 +926,6 @@ def api_sync_live_positions():
                     "coin_move_pct": 0.0,
                     "pnl_pct": 0.0,
                     "pnl_usdt": 0.0,
-                    "trailing_active": False,
-                    "highest_price": px,
                     "status": f"Synced Live Spot Bag (${val:.2f})"
                 }
                 imported.append(pair)
@@ -1018,40 +1021,47 @@ def api_manual_long():
         target_px = c_price * (1.0 + (req_pump / 100.0))
         esc_px = c_price * (1.0 - (esc_pct / 100.0))
 
+        base_pos = {
+            "pair": pair,
+            "phase": "ACTIVE_LONG",
+            "in_recovery": False,
+            "borrowed_from_reserve_usdt": 0.0,
+            "cooldown_until": 0.0,
+            "custom_skim_pct": None,
+            "custom_escape_pct": None,
+            "custom_bounce_pct": None,
+            "custom_recovery_pct": None,
+            "custom_debt_cap": None,
+            "custom_cooldown_mins": None,
+            "base_slot_usdt": custom_size,
+            "margin_usdt": custom_size,
+            "current_equity_usdt": custom_size,
+            "step_outs_count": 0,
+            "slot_skims": 0,
+            "slot_profit_usdt": 0.0,
+            "coin_move_pct": 0.0,
+            "pnl_pct": 0.0,
+            "pnl_usdt": 0.0
+        }
+
         if mode == "PAPER":
             with state_lock:
                 avail = float(STATE.get("paper_usdt_balance", 100.0))
                 if avail < custom_size:
                     return jsonify({"ok": False, "error": f"Insufficient Free Reserve USDT (${avail:.2f})"}), 400
                 STATE["paper_usdt_balance"] = round(avail - custom_size, 4)
-                STATE["spot_positions"][pair] = {
-                    "pair": pair,
+                base_pos.update({
                     "is_live": False,
-                    "phase": "ACTIVE_LONG",
-                    "in_recovery": False,
-                    "borrowed_from_reserve_usdt": 0.0,
-                    "cooldown_until": 0.0,
-                    "custom_skim_pct": None,
                     "coin_qty": custom_size / c_price,
-                    "base_slot_usdt": custom_size,
-                    "margin_usdt": custom_size,
-                    "current_equity_usdt": custom_size,
                     "entry_price": c_price,
                     "last_price": c_price,
                     "target_sell_price": target_px,
                     "escape_stop_price": esc_px,
                     "bottom_watch_price": c_price,
                     "reentry_trigger_price": c_price,
-                    "step_outs_count": 0,
-                    "slot_skims": 0,
-                    "slot_profit_usdt": 0.0,
-                    "coin_move_pct": 0.0,
-                    "pnl_pct": 0.0,
-                    "pnl_usdt": 0.0,
-                    "trailing_active": False,
-                    "highest_price": c_price,
-                    "status": f"Armed: Skims @ {fmt_px(target_px)} | -{esc_pct}% Shield @ {fmt_px(esc_px)}"
-                }
+                    "status": f"Armed: Instant Skim @ {fmt_px(target_px)} | -{esc_pct}% Shield @ {fmt_px(esc_px)}"
+                })
+                STATE["spot_positions"][pair] = base_pos
                 add_log(f"🚀 [DEMO SPOT BUY][{pair}] Deployed ${custom_size:.2f} @ {fmt_px(c_price)}")
                 save_state()
             return jsonify({"ok": True})
@@ -1071,34 +1081,18 @@ def api_manual_long():
                 esc_px = avg_px * (1.0 - (esc_pct / 100.0))
                 with state_lock:
                     STATE["live_spot_usdt"] = max(0.0, avail_spot - custom_size)
-                    STATE["spot_positions"][pair] = {
-                        "pair": pair,
+                    base_pos.update({
                         "is_live": True,
-                        "phase": "ACTIVE_LONG",
-                        "in_recovery": False,
-                        "borrowed_from_reserve_usdt": 0.0,
-                        "cooldown_until": 0.0,
-                        "custom_skim_pct": None,
                         "coin_qty": filled_qty,
-                        "base_slot_usdt": custom_size,
-                        "margin_usdt": custom_size,
-                        "current_equity_usdt": custom_size,
                         "entry_price": avg_px,
                         "last_price": avg_px,
                         "target_sell_price": target_px,
                         "escape_stop_price": esc_px,
                         "bottom_watch_price": avg_px,
                         "reentry_trigger_price": avg_px,
-                        "step_outs_count": 0,
-                        "slot_skims": 0,
-                        "slot_profit_usdt": 0.0,
-                        "coin_move_pct": 0.0,
-                        "pnl_pct": 0.0,
-                        "pnl_usdt": 0.0,
-                        "trailing_active": False,
-                        "highest_price": avg_px,
-                        "status": f"LIVE Spot Loop Active | -{esc_pct}% Shield Armed"
-                    }
+                        "status": f"LIVE Spot Loop Active | Instant Skim @ {fmt_px(target_px)}"
+                    })
+                    STATE["spot_positions"][pair] = base_pos
                     add_log(f"🚀 [LIVE SPOT BUY][{pair}] Bought ${custom_size:.2f} @ {fmt_px(avg_px)}")
                     save_state()
                 return jsonify({"ok": True})
@@ -1120,10 +1114,10 @@ def api_step_out_or_resnipe_now():
         base_slot = float(pos.get("base_slot_usdt", 10.0))
         margin_usdt = float(pos.get("margin_usdt", 10.0))
         current_debt = float(pos.get("borrowed_from_reserve_usdt", 0.0))
-        max_debt_cap = float(STATE.get("max_debt_per_coin", 0.50))
-        reentry_bounce = float(STATE.get("reentry_bounce_pct", 1.6))
-        rec_pump = float(STATE.get("recovery_pump_pct", 1.60))
-        esc_pct = float(STATE.get("escape_dump_pct", 4.0))
+        max_debt_cap = float(pos["custom_debt_cap"]) if pos.get("custom_debt_cap") is not None else float(STATE.get("max_debt_per_coin", 0.50))
+        reentry_bounce = float(pos["custom_bounce_pct"]) if pos.get("custom_bounce_pct") is not None else float(STATE.get("reentry_bounce_pct", 1.6))
+        rec_pump = float(pos["custom_recovery_pct"]) if pos.get("custom_recovery_pct") is not None else float(STATE.get("recovery_pump_pct", 1.60))
+        esc_pct = float(pos["custom_escape_pct"]) if pos.get("custom_escape_pct") is not None else float(STATE.get("escape_dump_pct", 4.0))
         fee_buf = float(STATE.get("spot_fee_buffer_pct", 0.40))
 
     if phase == "ACTIVE_LONG":
@@ -1191,8 +1185,6 @@ def api_step_out_or_resnipe_now():
             pos["cooldown_until"] = 0.0
             pos["target_sell_price"] = new_target
             pos["escape_stop_price"] = pos["entry_price"] * (1.0 - (esc_pct / 100.0))
-            pos["trailing_active"] = False
-            pos["highest_price"] = pos["entry_price"]
             pos["pnl_pct"] = 0.0
             pos["pnl_usdt"] = 0.0
             pos["status"] = f"🎯 Manual Re-Buy ${pos['margin_usdt']:.2f} @ {fmt_px(pos['entry_price'])}"
@@ -1225,19 +1217,19 @@ def api_update_config():
         if d.get("slot_size_usdt"):
             STATE["slot_size_usdt"] = max(1.0, float(d["slot_size_usdt"]))
         if d.get("skim_profit_pct"):
-            STATE["skim_profit_pct"] = max(0.2, float(d["skim_profit_pct"]))
+            STATE["skim_profit_pct"] = max(0.1, float(d["skim_profit_pct"]))
         if d.get("escape_dump_pct"):
             STATE["escape_dump_pct"] = max(0.5, float(d["escape_dump_pct"]))
         if d.get("reentry_bounce_pct"):
             STATE["reentry_bounce_pct"] = max(0.2, float(d["reentry_bounce_pct"]))
         if d.get("recovery_pump_pct"):
-            STATE["recovery_pump_pct"] = max(0.5, float(d["recovery_pump_pct"]))
+            STATE["recovery_pump_pct"] = max(0.2, float(d["recovery_pump_pct"]))
         if d.get("max_debt_per_coin") is not None and d.get("max_debt_per_coin") != "":
             STATE["max_debt_per_coin"] = max(0.0, float(d["max_debt_per_coin"]))
         if d.get("cooldown_minutes") is not None and d.get("cooldown_minutes") != "":
             STATE["cooldown_minutes"] = max(0, int(float(d["cooldown_minutes"])))
         add_log(
-            f"⚙️ Saved v4.4 Settings: Shield=-{STATE['escape_dump_pct']}% | Bounce=+{STATE['reentry_bounce_pct']}% | "
+            f"⚙️ Saved Global Settings: Shield=-{STATE['escape_dump_pct']}% | Bounce=+{STATE['reentry_bounce_pct']}% | "
             f"Rec=+{STATE['recovery_pump_pct']}% | Debt Cap=${STATE['max_debt_per_coin']:.2f} | Cooldown={STATE['cooldown_minutes']}m"
         )
         save_state()
@@ -1273,7 +1265,7 @@ def api_sync_keys():
 
 
 # =============================================================================
-# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — VAULTSKIMMER v4.4 PRO
+# PEAK INSTITUTIONAL OBSIDIAN-GLASS UI — VAULTSKIMMER v4.5 PRO
 # =============================================================================
 HTML_UI = """
 <!DOCTYPE html>
@@ -1287,13 +1279,13 @@ HTML_UI = """
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=JetBrains+Mono:wght@500;700;800&display=swap" rel="stylesheet" />
-  <title>VaultSkimmer v4.4 PRO | Institutional Spot Bull Terminal</title>
+  <title>VaultSkimmer v4.5 PRO | Instant Spot Bull Terminal</title>
   <style>
     :root {
       --bg: #030706;
       --surface: rgba(10, 20, 17, 0.84);
       --border: rgba(255, 255, 255, 0.08);
-      --border-glow: rgba(0, 245, 160, 0.40);
+      --border-glow: rgba(0, 245, 160, 0.42);
       --neon: #00f5a0;
       --neon-soft: rgba(0, 245, 160, 0.14);
       --cyan: #00d9f5;
@@ -1470,16 +1462,16 @@ HTML_UI = """
       font-family: var(--mono); font-size: 0.73rem; color: #d4e4df; line-height: 1.65;
     }
 
-    /* EDIT SKIM MODAL */
+    /* FULL PER-TOKEN RULES MODAL */
     .modal-bg {
-      display: none; position: fixed; inset: 0; background: rgba(2, 6, 5, 0.82);
-      backdrop-filter: blur(8px); z-index: 999; align-items: center; justify-content: center; padding: 16px;
+      display: none; position: fixed; inset: 0; background: rgba(2, 6, 5, 0.84);
+      backdrop-filter: blur(10px); z-index: 999; align-items: center; justify-content: center; padding: 16px;
     }
     .modal-bg.open { display: flex; }
     .modal-card {
       background: linear-gradient(180deg, #0b1c17, #06100d); border: 1px solid var(--border-glow);
-      border-radius: 18px; width: 100%; max-width: 380px; padding: 22px;
-      box-shadow: 0 24px 60px rgba(0,0,0,0.8);
+      border-radius: 18px; width: 100%; max-width: 440px; padding: 22px;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.85);
     }
   </style>
 </head>
@@ -1490,8 +1482,8 @@ HTML_UI = """
   <div class="hero">
     <div class="hero-top">
       <div>
-        <div class="logo">🟢 VAULTSKIMMER <span class="badge">v4.4 PRO BULL SPOT</span></div>
-        <div class="sub">Per-Token Skim Editor • Trailing Bottom Re-Buy • Uniform 0.00% PnL • Team Debt-Clearing</div>
+        <div class="logo">🟢 VAULTSKIMMER <span class="badge">v4.5 PRO INSTANT</span></div>
+        <div class="sub">Instant Target Skim & Re-Buy • Full Per-Token Rules Editor • Trailing Bottom Re-Buy • Uniform 0.00% PnL</div>
       </div>
       <div class="btn-row">
         <button class="btn btn-bull" onclick="installApp()" id="installBtn">📲 Install App</button>
@@ -1502,7 +1494,7 @@ HTML_UI = """
     </div>
     <div class="strip">
       <div style="font-weight:700; color:var(--text);"><span class="pulse-dot"></span><span id="apiStatus">Paper Simulation Active</span></div>
-      <div>v4.4 Shield: <strong>-<span id="ruleEsc">4.0</span>% Out → <span id="ruleCd">20</span>m → +<span id="ruleBounce">1.6</span>% From New Bottom → +<span id="ruleRec">1.6</span>% Recovery</strong></div>
+      <div>v4.5 Global: <strong>-<span id="ruleEsc">4.0</span>% Out → <span id="ruleCd">20</span>m → +<span id="ruleBounce">1.6</span>% Bounce → +<span id="ruleRec">1.6</span>% Recovery</strong></div>
       <div>Sweep: <strong id="lastUpdate" style="font-family:var(--mono);color:#fff;">--:--:--</strong> (<strong class="c-neon" id="scanMs">0</strong>ms | #<span id="cycleNum">0</span>)</div>
     </div>
   </div>
@@ -1550,7 +1542,7 @@ HTML_UI = """
     <div class="card kpi-card">
       <div class="lbl">2. Reserve Cash (Top-Up Pool)</div>
       <div class="val c-amber" id="freeUsdt">$100.00</div>
-      <div class="sub">Debt Cap: $<strong id="capLbl" style="color:#fff;">0.50</strong> / coin</div>
+      <div class="sub">Global Cap: $<strong id="capLbl" style="color:#fff;">0.50</strong> / coin</div>
     </div>
     <div class="card kpi-card kpi-vault">
       <div class="lbl">
@@ -1558,7 +1550,7 @@ HTML_UI = """
         <button class="btn-del" style="padding:3px 8px;font-size:0.64rem;" onclick="resetProfitVault()">🔄 Reset</button>
       </div>
       <div class="val c-neon" id="profitVault">+$0.0000</div>
-      <div class="sub">Wins: <strong id="skimCount" style="color:#fff;">0</strong> | Zero Fake Deposit Cash</div>
+      <div class="sub">Wins: <strong id="skimCount" style="color:#fff;">0</strong> | Instant Skim Active</div>
     </div>
     <div class="card kpi-card">
       <div class="lbl">4. Total Spot Net Worth</div>
@@ -1571,8 +1563,8 @@ HTML_UI = """
   <div class="grid-main">
     <div class="card">
       <div class="sec-title">
-        <span>🟢 Active Spot Long Loops (v4.4 Smart Recovery)</span>
-        <span style="font-size:0.7rem;color:var(--cyan);">Tap ✏️ Edit Skim on Any Coin</span>
+        <span>🟢 Active Spot Long Loops (Instant Skim)</span>
+        <span style="font-size:0.7rem;color:var(--cyan);">Tap ✏️ Edit Rules on Any Coin</span>
       </div>
       <div id="positionsBox"></div>
     </div>
@@ -1610,7 +1602,7 @@ HTML_UI = """
 
       <!-- ENGINE PARAMETERS -->
       <div class="card">
-        <div class="sec-title">⚙️ v4.4 Global Shield, Debt Cap & Cooldown</div>
+        <div class="sec-title">⚙️ v4.5 Global Shield, Debt Cap & Cooldown</div>
         <div class="input-grid-3">
           <div>
             <label>Escape Dump (%)</label>
@@ -1694,16 +1686,26 @@ HTML_UI = """
 
 </div>
 
-<!-- PER-TOKEN SKIM EDIT MODAL -->
+<!-- FULL PER-TOKEN RULES EDIT MODAL -->
 <div class="modal-bg" id="editModal" onclick="if(event.target.id==='editModal') closeEditModal()">
   <div class="modal-card">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
-      <strong style="font-size:1.05rem;color:var(--neon);">✏️ Edit Skim % — <span id="editPairLbl"></span></strong>
+      <strong style="font-size:1.05rem;color:var(--neon);">✏️ Edit All Rules — <span id="editPairLbl"></span></strong>
       <button class="btn-del" style="padding:4px 9px;" onclick="closeEditModal()">✖</button>
     </div>
-    <label>Custom Normal Skim Target (%) for this coin only</label>
-    <input type="number" id="editSkimInput" step="0.05" min="0.2" max="20" style="margin-bottom:14px;" />
-    <button class="btn btn-bull" style="width:100%;padding:11px;" onclick="applyCoinSkim()">✅ Apply Skim %</button>
+    <div class="input-grid-2">
+      <div><label>Normal Skim (%)</label><input type="number" id="edSkim" step="0.05" min="0.1" max="20" /></div>
+      <div><label>Escape Dump (%)</label><input type="number" id="edEsc" step="0.1" min="0.5" max="50" /></div>
+    </div>
+    <div class="input-grid-2">
+      <div><label>Bottom Bounce (%)</label><input type="number" id="edBounce" step="0.1" min="0.2" max="20" /></div>
+      <div><label>Recovery Pump (%)</label><input type="number" id="edRec" step="0.1" min="0.2" max="20" /></div>
+    </div>
+    <div class="input-grid-2" style="margin-bottom:16px;">
+      <div><label>Debt Cap ($)</label><input type="number" id="edCap" step="0.10" min="0" /></div>
+      <div><label>Cooldown (mins)</label><input type="number" id="edCd" step="1" min="0" /></div>
+    </div>
+    <button class="btn btn-bull" style="width:100%;padding:12px;" onclick="applyCoinSettings()">✅ Apply Rules to This Coin</button>
   </div>
 </div>
 
@@ -1731,24 +1733,36 @@ HTML_UI = """
   function fillPair(p) { document.getElementById('customPairInput').value = p; }
 
   let editingPair = '';
-  function openEditModal(pair, currentSkim) {
+  function openEditModal(pair, skim, esc, bounce, rec, cap, cd) {
     editingPair = pair;
     document.getElementById('editPairLbl').innerText = pair;
-    document.getElementById('editSkimInput').value = Number(currentSkim).toFixed(2);
+    document.getElementById('edSkim').value = Number(skim).toFixed(2);
+    document.getElementById('edEsc').value = Number(esc).toFixed(1);
+    document.getElementById('edBounce').value = Number(bounce).toFixed(1);
+    document.getElementById('edRec').value = Number(rec).toFixed(1);
+    document.getElementById('edCap').value = Number(cap).toFixed(2);
+    document.getElementById('edCd').value = Number(cd);
     document.getElementById('editModal').classList.add('open');
   }
   function closeEditModal() {
     document.getElementById('editModal').classList.remove('open');
   }
-  async function applyCoinSkim() {
-    const val = document.getElementById('editSkimInput').value;
-    const r = await fetch('/api/update_coin_skim', {
+  async function applyCoinSettings() {
+    const r = await fetch('/api/update_coin_settings', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ pair: editingPair, skim_pct: val })
+      body: JSON.stringify({
+        pair: editingPair,
+        skim_pct: document.getElementById('edSkim').value,
+        escape_pct: document.getElementById('edEsc').value,
+        bounce_pct: document.getElementById('edBounce').value,
+        recovery_pct: document.getElementById('edRec').value,
+        debt_cap: document.getElementById('edCap').value,
+        cooldown_mins: document.getElementById('edCd').value
+      })
     });
     const d = await r.json();
-    if (!d.ok) alert(d.error || 'Invalid value');
+    if (!d.ok) alert(d.error || 'Invalid values');
     else closeEditModal();
     await refresh();
   }
@@ -1873,18 +1887,18 @@ HTML_UI = """
       document.getElementById('scanMs').innerText = s.last_scan_ms;
       document.getElementById('cycleNum').innerText = s.cycle_count;
 
-      const escVal = Number(s.escape_dump_pct || 4.0).toFixed(1);
-      const bounceVal = Number(s.reentry_bounce_pct || 1.6).toFixed(1);
-      const recVal = Number(s.recovery_pump_pct || 1.6).toFixed(1);
-      const capVal = Number(s.max_debt_per_coin !== undefined ? s.max_debt_per_coin : 0.50).toFixed(2);
-      const cdVal = Number(s.cooldown_minutes !== undefined ? s.cooldown_minutes : 20);
-      const globalSkim = Number(s.skim_profit_pct || 1.0);
+      const gEsc = Number(s.escape_dump_pct || 4.0);
+      const gBounce = Number(s.reentry_bounce_pct || 1.6);
+      const gRec = Number(s.recovery_pump_pct || 1.6);
+      const gCap = Number(s.max_debt_per_coin !== undefined ? s.max_debt_per_coin : 0.50);
+      const gCd = Number(s.cooldown_minutes !== undefined ? s.cooldown_minutes : 20);
+      const gSkim = Number(s.skim_profit_pct || 1.0);
 
-      document.getElementById('ruleEsc').innerText = escVal;
-      document.getElementById('ruleBounce').innerText = bounceVal;
-      document.getElementById('ruleRec').innerText = recVal;
-      document.getElementById('ruleCd').innerText = cdVal;
-      document.getElementById('capLbl').innerText = capVal;
+      document.getElementById('ruleEsc').innerText = gEsc.toFixed(1);
+      document.getElementById('ruleBounce').innerText = gBounce.toFixed(1);
+      document.getElementById('ruleRec').innerText = gRec.toFixed(1);
+      document.getElementById('ruleCd').innerText = gCd;
+      document.getElementById('capLbl').innerText = gCap.toFixed(2);
 
       const modeBtn = document.getElementById('modeBtn');
       modeBtn.innerText = s.mode === 'LIVE' ? '🔀 Mode: LIVE SPOT' : '🔀 Mode: PAPER';
@@ -1924,15 +1938,22 @@ HTML_UI = """
           const slotSkims = Number(p.slot_skims || 0);
           const slotProf = Number(p.slot_profit_usdt || 0);
           const borrowed = Number(p.borrowed_from_reserve_usdt || 0);
-          const coinSkim = (p.custom_skim_pct !== null && p.custom_skim_pct !== undefined) ? Number(p.custom_skim_pct) : globalSkim;
-          const goalPct = p.in_recovery ? Number(s.recovery_pump_pct || 1.6) : coinSkim;
+
+          const cSkim = (p.custom_skim_pct !== null && p.custom_skim_pct !== undefined) ? Number(p.custom_skim_pct) : gSkim;
+          const cEsc = (p.custom_escape_pct !== null && p.custom_escape_pct !== undefined) ? Number(p.custom_escape_pct) : gEsc;
+          const cBounce = (p.custom_bounce_pct !== null && p.custom_bounce_pct !== undefined) ? Number(p.custom_bounce_pct) : gBounce;
+          const cRec = (p.custom_recovery_pct !== null && p.custom_recovery_pct !== undefined) ? Number(p.custom_recovery_pct) : gRec;
+          const cCap = (p.custom_debt_cap !== null && p.custom_debt_cap !== undefined) ? Number(p.custom_debt_cap) : gCap;
+          const cCd = (p.custom_cooldown_mins !== null && p.custom_cooldown_mins !== undefined) ? Number(p.custom_cooldown_mins) : gCd;
+
+          const goalPct = p.in_recovery ? cRec : cSkim;
           const prog = phase === 'STEPPED_OUT_HOLD' ? 50 : Math.max(0, Math.min(100, (pnl / (goalPct + 0.40)) * 100));
 
           const phaseBadge = phase === 'STEPPED_OUT_HOLD'
             ? `<span class="step-pill" style="border-color:var(--amber);color:var(--amber);">🛡️ SAFE $${Number(p.margin_usdt).toFixed(2)}</span>`
             : (p.in_recovery
                 ? `<span class="step-pill">🎯 RECOVERY (DEBT: $${borrowed.toFixed(2)})</span>`
-                : `<span class="bull-pill">$${Number(p.margin_usdt).toFixed(2)} • Skim ${coinSkim.toFixed(2)}%</span>`);
+                : `<span class="bull-pill">$${Number(p.margin_usdt).toFixed(2)} • Skim ${cSkim.toFixed(2)}%</span>`);
 
           const actionBtn = phase === 'STEPPED_OUT_HOLD'
             ? `<button class="btn-step" onclick="stepOutOrResnipe('${p.pair}')">🎯 Re-Buy Now</button>`
@@ -1953,9 +1974,9 @@ HTML_UI = """
 
               <div class="metrics-box">
                 <div>${phase === 'STEPPED_OUT_HOLD' ? `Trailing Bottom: <strong class="c-cyan">${fmtPx(p.bottom_watch_price)}</strong>` : `Entry Floor: <strong>${fmtPx(p.entry_price)}</strong>`}</div>
-                <div>${phase === 'STEPPED_OUT_HOLD' ? `Re-Buy (+${bounceVal}%): <strong class="c-amber">${fmtPx(p.reentry_trigger_price)}</strong>` : `Sell Skim Target: <strong class="c-neon">${fmtPx(p.target_sell_price)}</strong>`}</div>
+                <div>${phase === 'STEPPED_OUT_HOLD' ? `Re-Buy (+${cBounce.toFixed(1)}%): <strong class="c-amber">${fmtPx(p.reentry_trigger_price)}</strong>` : `Instant Skim Target: <strong class="c-neon">${fmtPx(p.target_sell_price)}</strong>`}</div>
                 <div>Live Price: <strong>${fmtPx(p.last_price)}</strong></div>
-                <div>${phase === 'STEPPED_OUT_HOLD' ? `Debt Room Left: <strong class="c-cyan">$${Math.max(0, Number(capVal) - borrowed).toFixed(2)}</strong>` : `-${escVal}% Shield: <strong class="c-crimson">${fmtPx(p.escape_stop_price)}</strong>`}</div>
+                <div>${phase === 'STEPPED_OUT_HOLD' ? `Debt Room Left: <strong class="c-cyan">$${Math.max(0, cCap - borrowed).toFixed(2)}</strong>` : `-${cEsc.toFixed(1)}% Shield: <strong class="c-crimson">${fmtPx(p.escape_stop_price)}</strong>`}</div>
               </div>
 
               <div style="display:flex;justify-content:space-between;font-size:0.71rem;color:var(--muted);">
@@ -1967,7 +1988,7 @@ HTML_UI = """
               <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-top:10px;">
                 <div style="display:flex;gap:6px;">
                   ${actionBtn}
-                  <button class="btn-edit" onclick="openEditModal('${p.pair}', ${coinSkim})">✏️ Edit Skim</button>
+                  <button class="btn-edit" onclick="openEditModal('${p.pair}', ${cSkim}, ${cEsc}, ${cBounce}, ${cRec}, ${cCap}, ${cCd})">✏️ Edit Rules</button>
                 </div>
                 <button class="btn-del" onclick="closeSlot('${p.pair}')">✖ Sell & Close</button>
               </div>
@@ -2003,7 +2024,7 @@ HTML_UI = """
           </tr>
         `).join('');
       } else {
-        lb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px;">Waiting for next green-candle skim...</td></tr>`;
+        lb.innerHTML = `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:18px;">Waiting for next instant skim...</td></tr>`;
       }
 
       document.getElementById('logBox').innerHTML = (s.logs || []).join('<br/>');
